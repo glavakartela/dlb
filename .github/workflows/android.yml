@@ -40,8 +40,6 @@ jobs:
 
           SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
 
-          yes | "$SDKMANAGER" "platforms;android-36"
-
           DESKTOP_DROP="$HOME/.pub-cache/hosted/pub.dev/desktop_drop-0.5.0"
 
           if [ ! -d "$DESKTOP_DROP" ]; then
