@@ -27,10 +27,10 @@ class S {
   String get fast => t('Быстро', 'Fast');
   String get balanced => t('Баланс', 'Balanced');
   String get maximum => t('Максимум', 'Maximum');
-  String ramHint(int level, int mb) => _(
+  String ramHint(int level, int mb) => t(
       'Уровень $level · около $mb МБ памяти',
       'Level $level · about $mb MB of memory');
-  String get slowNote => _(
+  String get slowNote => t(
       'Чем сильнее сжатие, тем дольше работа: примерно 0,4 МБ/с.',
       'Stronger compression takes longer: roughly 0.4 MB/s.');
   String get saveAs => t('Сохранить как', 'Save as');
@@ -69,25 +69,25 @@ class S {
   String get savedSpace => t('меньше', 'smaller');
   String speed(String s) => t('$s/с', '$s/s');
   String eta(String s) => t('осталось $s', '$s left');
-  String get androidStorageNote => _(
+  String get androidStorageNote => t(
       'На Android результат сначала создаётся во временной папке приложения, затем его можно сохранить через системный диалог.',
       'On Android the result is first built in the app cache; then you can save it with the system dialog.');
 
   String get helpTitle => t('Справка', 'Help');
   String get helpWhatTitle => t('Как это работает', 'How it works');
-  String get helpWhat => _(
+  String get helpWhat => t(
       'DLB использует контекстное смешивание (как PAQ): десятки моделей предсказывают каждый бит, а арифметический кодер записывает результат. Это сильнее zip и xz, но медленнее.',
       'DLB uses context mixing (like PAQ): dozens of models predict every bit and an arithmetic coder stores the result. Stronger than zip and xz, but slower.');
   String get helpGoodTitle => t('Хорошо сжимается', 'Compresses well');
-  String get helpGood => _(
+  String get helpGood => t(
       'Текст, исходный код, логи, таблицы, повторяющиеся данные: в 4-9 раз, а при сильной избыточности в десятки раз.',
       'Text, source code, logs, tables, repetitive data: 4-9x, and tens of times when data is highly redundant.');
   String get helpBadTitle => t('Почти не сжимается', 'Barely compresses');
-  String get helpBad => _(
+  String get helpBad => t(
       'JPEG, MP4, ZIP, зашифрованные и случайные данные. Это ограничение теории, а не программы.',
       'JPEG, MP4, ZIP, encrypted and random data. That is a limit of theory, not of the program.');
   String get helpLimitsTitle => t('Ограничения', 'Limits');
-  String get helpLimits => _(
+  String get helpLimits => t(
       'Один архив до 4 ГиБ. Файлы упаковываются вместе (solid), поэтому для извлечения одного файла распаковывается весь архив.',
       'One archive up to 4 GiB. Files are packed together (solid), so extracting one file decompresses the whole archive.');
   String get helpFormat => t('Формат', 'Format');
