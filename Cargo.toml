@@ -1,0 +1,21 @@
+[package]
+name = "dlb"
+version = "0.1.0"
+edition = "2021"
+description = "DLB: context-mixing file compressor with its own .dlb format"
+
+[lib]
+name = "dlb"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "dlb"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
