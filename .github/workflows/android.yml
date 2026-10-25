@@ -33,35 +33,34 @@ jobs:
 
       - run: bash app/dlb_app/scripts/setup.sh
 
+      - name: Resolve dependencies
+        working-directory: app/dlb_app
+        run: flutter pub get
+
       - name: Fix desktop_drop compileSdk
         shell: bash
         run: |
           set -e
 
-          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          # Динамический поиск директории desktop_drop без жесткой привязки к версии 0.5.0
+          DESKTOP_DROP_DIR=$(find "$HOME/.pub-cache" -type d -name "desktop_drop-*" | head -n 1)
 
-          DESKTOP_DROP="$HOME/.pub-cache/hosted/pub.dev/desktop_drop-0.5.0"
+          if [ -z "$DESKTOP_DROP_DIR" ] || [ ! -d "$DESKTOP_DROP_DIR" ]; then
+            echo "::warning::desktop_drop not found in pub-cache. Skipping patch."
+          else
+            echo "Patching desktop_drop at $DESKTOP_DROP_DIR"
 
-          if [ ! -d "$DESKTOP_DROP" ]; then
-            echo "::error::desktop_drop 0.5.0 was not found at $DESKTOP_DROP"
-            find "$HOME/.pub-cache/hosted/pub.dev" -maxdepth 1 -type d -name 'desktop_drop-*' -print
-            exit 1
+            find "$DESKTOP_DROP_DIR/android" \
+              -type f \
+              \( -name "build.gradle" -o -name "build.gradle.kts" \) \
+              -print \
+              -exec sed -i \
+                -E 's/compileSdkVersion[[:space:]]+[0-9]+/compileSdkVersion 34/g; s/compileSdk[[:space:]]*=[[:space:]]*[0-9]+/compileSdk = 34/g' \
+                {} +
+
+            echo "Result:"
+            grep -RIn -E 'compileSdk(Version)?' "$DESKTOP_DROP_DIR/android" || true
           fi
-
-          echo "Patching $DESKTOP_DROP"
-
-          find "$DESKTOP_DROP/android" \
-            -type f \
-            \( -name "build.gradle" -o -name "build.gradle.kts" \) \
-            -print \
-            -exec sed -i \
-              -E 's/compileSdkVersion[[:space:]]+33/compileSdkVersion 36/g; s/compileSdk[[:space:]]*=[[:space:]]*33/compileSdk = 36/g' \
-              {} \;
-
-          echo "Result:"
-          grep -RIn \
-            -E 'compileSdk(Version)?' \
-            "$DESKTOP_DROP/android" || true
 
       # ANDROID_NDK_HOME is preinstalled on GitHub's ubuntu runners
       - run: bash app/dlb_app/scripts/build_native.sh android
