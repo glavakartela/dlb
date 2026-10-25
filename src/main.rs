@@ -1,4 +1,4 @@
-use dlb::{archive, compress_payload, decompress_payload};
+use dlbcore::{archive, compress_payload, decompress_payload};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::exit;
@@ -79,7 +79,7 @@ fn main() {
                 PathBuf::from(n)
             });
             let payload = archive::build_payload(&inputs).unwrap_or_else(|e| fail(&e.to_string()));
-            if payload.len() > dlb::MAX_PAYLOAD {
+            if payload.len() > dlbcore::MAX_PAYLOAD {
                 fail("input is larger than 4 GiB; split it into several archives");
             }
             let t0 = Instant::now();

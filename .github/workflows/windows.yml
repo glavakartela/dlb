@@ -1,0 +1,57 @@
+name: Windows
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cli:
+    name: CLI ${{ matrix.target }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - i686-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }} --bin dlb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dlb-cli-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/dlb.exe
+
+  app:
+    name: Flutter app (x64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: cargo test --release
+      - run: bash app/dlb_app/scripts/setup.sh
+      - run: flutter analyze --no-fatal-infos
+        working-directory: app/dlb_app
+      - run: flutter test
+        working-directory: app/dlb_app
+      - run: flutter build windows --release
+        working-directory: app/dlb_app
+      - run: bash app/dlb_app/scripts/build_native.sh windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dlb-app-windows-x64
+          path: app/dlb_app/build/windows/x64/runner/Release

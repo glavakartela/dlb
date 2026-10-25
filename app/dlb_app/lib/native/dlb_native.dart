@@ -91,10 +91,10 @@ class DlbNative {
 
   static DynamicLibrary _open() {
     if (Platform.isAndroid || Platform.isLinux) {
-      return DynamicLibrary.open('libdlb.so');
+      return DynamicLibrary.open('libdlbcore.so');
     }
-    if (Platform.isWindows) return DynamicLibrary.open('dlb.dll');
-    if (Platform.isMacOS) return DynamicLibrary.open('libdlb.dylib');
+    if (Platform.isWindows) return DynamicLibrary.open('dlbcore.dll');
+    if (Platform.isMacOS) return DynamicLibrary.open('libdlbcore.dylib');
     throw UnsupportedError('DLB: unsupported platform');
   }
 

@@ -1,0 +1,36 @@
+name: Android
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    name: APK (arm64-v8a, armeabi-v7a, x86, x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: cargo install cargo-ndk --locked
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: bash app/dlb_app/scripts/setup.sh
+      # ANDROID_NDK_HOME is preinstalled on GitHub's ubuntu runners
+      - run: bash app/dlb_app/scripts/build_native.sh android
+      - run: flutter build apk --release --split-per-abi
+        working-directory: app/dlb_app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dlb-app-android
+          path: app/dlb_app/build/app/outputs/flutter-apk/*.apk

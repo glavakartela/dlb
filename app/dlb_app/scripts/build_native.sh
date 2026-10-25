@@ -11,9 +11,9 @@ case "${1:-}" in
       -o "$APP/android/app/src/main/jniLibs" build --release ;;
   linux)     # run after `flutter build linux --release`
     cargo build --release
-    install -D target/release/libdlb.so "$APP/build/linux/x64/release/bundle/lib/libdlb.so" ;;
+    install -D target/release/libdlbcore.so "$APP/build/linux/x64/release/bundle/lib/libdlbcore.so" ;;
   windows)   # run after `flutter build windows --release` (Git Bash / MSYS)
     cargo build --release
-    cp target/release/dlb.dll "$APP/build/windows/x64/runner/Release/dlb.dll" ;;
+    cp target/release/dlbcore.dll "$APP/build/windows/x64/runner/Release/dlbcore.dll" ;;
   *) echo "usage: $0 android|linux|windows"; exit 2 ;;
 esac

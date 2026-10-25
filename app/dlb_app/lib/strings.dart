@@ -91,6 +91,7 @@ class S {
       'Один архив до 4 ГиБ. Файлы упаковываются вместе (solid), поэтому для извлечения одного файла распаковывается весь архив.',
       'One archive up to 4 GiB. Files are packed together (solid), so extracting one file decompresses the whole archive.');
   String get helpFormat => t('Формат', 'Format');
+  String get language => t('Язык', 'Language');
 
   static String _plural(int n, String one, String few, String many) {
     final m10 = n % 10, m100 = n % 100;

@@ -5,7 +5,7 @@ edition = "2021"
 description = "DLB: context-mixing file compressor with its own .dlb format"
 
 [lib]
-name = "dlb"
+name = "dlbcore"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 

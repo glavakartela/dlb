@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../format.dart';
+import '../locale_controller.dart';
 import '../strings.dart';
 import '../widgets/layout.dart';
 
@@ -18,6 +19,32 @@ class HelpPage extends StatelessWidget {
         children: [
           PageHeader(title: s.helpTitle, subtitle: 'DLB · context mixing'),
           const SizedBox(height: 16),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(s.language, style: t.textTheme.titleMedium),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: SegmentedButton<String>(
+                      showSelectedIcon: false,
+                      segments: const [
+                        ButtonSegment(value: 'en', label: Text('English')),
+                        ButtonSegment(value: 'ru', label: Text('Русский')),
+                      ],
+                      selected: {s.ru ? 'ru' : 'en'},
+                      onSelectionChanged: (v) =>
+                          localeController.select(v.first),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
           _Info(Icons.psychology_outlined, s.helpWhatTitle, s.helpWhat),
           const SizedBox(height: 8),
           _Info(Icons.trending_down, s.helpGoodTitle, s.helpGood),
