@@ -11,63 +11,25 @@ jobs:
   apk:
     name: APK (arm64-v8a, armeabi-v7a, x86, x86_64)
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-
       - run: cargo install cargo-ndk --locked
-
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
-
       - run: bash app/dlb_app/scripts/setup.sh
-
-      - name: Resolve dependencies
-        working-directory: app/dlb_app
-        run: flutter pub get
-
-      - name: Fix desktop_drop compileSdk
-        shell: bash
-        run: |
-          set -e
-
-          # Динамический поиск директории desktop_drop без жесткой привязки к версии 0.5.0
-          DESKTOP_DROP_DIR=$(find "$HOME/.pub-cache" -type d -name "desktop_drop-*" | head -n 1)
-
-          if [ -z "$DESKTOP_DROP_DIR" ] || [ ! -d "$DESKTOP_DROP_DIR" ]; then
-            echo "::warning::desktop_drop not found in pub-cache. Skipping patch."
-          else
-            echo "Patching desktop_drop at $DESKTOP_DROP_DIR"
-
-            find "$DESKTOP_DROP_DIR/android" \
-              -type f \
-              \( -name "build.gradle" -o -name "build.gradle.kts" \) \
-              -print \
-              -exec sed -i \
-                -E 's/compileSdkVersion[[:space:]]+[0-9]+/compileSdkVersion 34/g; s/compileSdk[[:space:]]*=[[:space:]]*[0-9]+/compileSdk = 34/g' \
-                {} +
-
-            echo "Result:"
-            grep -RIn -E 'compileSdk(Version)?' "$DESKTOP_DROP_DIR/android" || true
-          fi
-
       # ANDROID_NDK_HOME is preinstalled on GitHub's ubuntu runners
       - run: bash app/dlb_app/scripts/build_native.sh android
-
       - run: flutter build apk --release --split-per-abi
         working-directory: app/dlb_app
-
       - uses: actions/upload-artifact@v4
         with:
           name: dlb-app-android
