@@ -20,6 +20,10 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      - name: Android SDK platform 35 (Android 15) + build tools
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "platforms;android-34" "build-tools;35.0.0"
       - run: cargo install cargo-ndk --locked
       - uses: subosito/flutter-action@v2
         with:
