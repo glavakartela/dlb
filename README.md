@@ -5,18 +5,20 @@ dependencies), plus a Flutter app on top of it.
 
 DLB uses **context mixing** (the PAQ / lpaq / cmix family) instead of LZ77 + Huffman like zip,
 xz and zstd. It is the strongest practical approach to lossless compression; the price is speed
-(about 0.4 MB/s, in both directions).
+(about 0.4 MB/s per thread). Large inputs are split into independent blocks that are compressed
+and decompressed on all CPU cores in parallel.
 
 ## Command line
 
 ```
-dlb c [-l 1-9] [-o out.dlb] <file|dir>...   compress  (level 7 default: ~115 MB RAM; 4: ~25 MB; 9: ~305 MB)
-dlb x <archive.dlb> [-C dir] [-f]           extract   (-f overwrites existing files)
+dlb c [-l 1-9] [-t N] [-o out.dlb] <file|dir>...   compress  (level 7 default: ~115 MB RAM per thread; 4: ~25 MB; 9: ~305 MB)
+dlb x [-t N] <archive.dlb> [-C dir] [-f]           extract   (-f overwrites existing files)
 dlb t <archive.dlb>                         test integrity (CRC-32)
 dlb l <archive.dlb>                         list contents
 ```
 
-Several files or folders are packed into one *solid* archive (files are grouped by extension),
+`-t N` sets the thread count (default: all cores, at most 8; `-t 0` = all cores, `-t 1` = single
+stream, best ratio). Memory grows with the number of threads. Several files or folders are packed into one *solid* archive (files are grouped by extension),
 which noticeably improves the ratio. Extraction refuses paths that escape the target folder and
 never overwrites without `-f`.
 
@@ -39,6 +41,23 @@ A ratio of "tens of times" is only possible when the data is redundant (logs, re
 templated text, sparse data). Already-compressed formats (JPEG, MP4, ZIP, archives) and
 encrypted or random data cannot be compressed at all; that is a theorem, not a limitation of
 this program. Typical text and source code compress x4 to x9, executables x3 to x5.
+
+### Parallel mode: speed vs. ratio
+
+The solid payload (files sorted by extension) is cut into blocks of at least 32 MiB, at file
+boundaries where possible, and each block is coded by its own model. Blocks only lose what a
+single stream would have learned or matched *across* the cut. Measured on a 48 MB mixed corpus
+(level 5, 2 cores in the test machine):
+
+| mode | size | ratio | time |
+|---|---|---|---|
+| `-t 1` (one stream) | 2,180,794 | x22.2 | 92.9 s |
+| `-t 2` (two blocks) | 2,357,242 | x20.5 | 49.6 s |
+
+About 1.9x faster on 2 cores for ~8% larger output. That corpus is a worst case (the same file
+repeated, with copies landing in different blocks); without long-range duplication across the
+cut the loss should be much smaller and shrinks as blocks get bigger. Use `-t 1` when ratio
+matters more than time. Decompression is parallel the same way.
 
 ## Flutter app (`app/dlb_app`)
 
@@ -96,12 +115,13 @@ on any other.
 
 | offset | size | field |
 |---|---|---|
-| 0 | 4 | magic `DLB1` |
-| 4 | 1 | flags (bit 0: data stored uncompressed, used as a fallback) |
-| 5 | 1 | `nbits`: log2 of the number of context-table slots |
+| 0 | 4 | magic `DLB2` |
+| 4 | 2 | reserved |
 | 6 | 8 | payload length |
-| 14 | 4 | CRC-32 of the payload |
-| 18 | ... | arithmetic-coder stream |
+| 14 | 4 | CRC-32 of the whole payload |
+| 18 | 4 | block count `n` |
+| 22 | 10 x n | block table: raw length u32, compressed length u32, flags u8 (bit 0: stored), `nbits` u8 |
+| ... | ... | the blocks' arithmetic-coder streams, back to back |
 
 Payload: `"DLAR"`, entry count, then per entry `name_len u16 | name | size u64 | mode u32`,
 followed by the data of all files back to back.
@@ -119,7 +139,7 @@ followed by the data of all files back to back.
 
 - one archive is at most 4 GiB and is processed in memory (add roughly 2x the data size to the
   RAM figures above)
-- single-threaded, about 0.4 MB/s
+- about 0.4 MB/s per thread; blocks run in parallel (see above)
 - no data-specific filters yet (x86 E8/E9, images, audio) and no built-in dictionary; these are
   the next steps for even stronger compression
 - empty folders and symlinks are not stored

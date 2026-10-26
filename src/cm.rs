@@ -232,7 +232,6 @@ pub struct Predictor {
     stretch: Vec<i16>,
     rt: Vec<i32>,
     conf: [i32; 64],
-    hist: Vec<u8>,
     c0: u32,
     c4: u32,
     c8: u32,
@@ -258,7 +257,7 @@ pub struct Predictor {
 }
 
 impl Predictor {
-    pub fn new(nbits: u32, expected_len: usize) -> Self {
+    pub fn new(nbits: u32) -> Self {
         let hbits = (nbits.saturating_sub(2)).clamp(16, 22);
         let mut conf = [0i32; 64];
         for (n, c) in conf.iter_mut().enumerate() {
@@ -270,7 +269,6 @@ impl Predictor {
             stretch: build_stretch(),
             rt: build_rt(),
             conf,
-            hist: Vec::with_capacity(expected_len.min(1 << 28) + 8),
             c0: 1,
             c4: 0,
             c8: 0,
@@ -430,7 +428,6 @@ impl Predictor {
         self.bitpos += 1;
         if self.bitpos == 8 {
             let c = (self.c0 & 0xFF) as u8;
-            self.hist.push(c);
             self.c8 = (self.c8 << 8) | (self.c4 >> 24);
             self.c4 = (self.c4 << 8) | c as u32;
             self.c0 = 1;
@@ -443,11 +440,20 @@ impl Predictor {
                 self.pword = self.word;
                 self.word = 0;
             }
-            for m in 0..NM {
-                self.mm[m].update_byte(&self.hist);
-            }
-            self.byte_update_contexts();
+            // The caller must now store the byte and call `end_byte` with the
+            // history (including this byte); that finishes the update and predicts.
+            return;
         }
+        self.predict();
+    }
+
+    /// Completes a byte: `hist` is everything coded so far, ending with the byte
+    /// just finished. The caller owns the history, so no copy is kept here.
+    pub fn end_byte(&mut self, hist: &[u8]) {
+        for m in 0..NM {
+            self.mm[m].update_byte(hist);
+        }
+        self.byte_update_contexts();
         self.predict();
     }
 }
@@ -531,14 +537,16 @@ pub fn cm_compress(
     nbits: u32,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Option<Vec<u8>> {
-    let mut pred = Predictor::new(nbits, data.len());
+    let mut pred = Predictor::new(nbits);
     let mut enc = Encoder::new(data.len() / 2 + 16);
-    for (i, &b) in data.iter().enumerate() {
+    for i in 0..data.len() {
+        let b = data[i];
         for j in (0..8).rev() {
             let y = ((b >> j) & 1) as u32;
             enc.encode(y, pred.p());
             pred.update(y);
         }
+        pred.end_byte(&data[..=i]);
         if i & 0xFFFF == 0 && !progress(i) {
             return None;
         }
@@ -547,15 +555,16 @@ pub fn cm_compress(
     Some(enc.finish())
 }
 
+/// Decodes exactly `out.len()` bytes into `out`. Returns false if cancelled.
 pub fn cm_decompress(
     comp: &[u8],
-    len: usize,
+    out: &mut [u8],
     nbits: u32,
     progress: &mut dyn FnMut(usize) -> bool,
-) -> Option<Vec<u8>> {
-    let mut pred = Predictor::new(nbits, len);
+) -> bool {
+    let len = out.len();
+    let mut pred = Predictor::new(nbits);
     let mut dec = Decoder::new(comp);
-    let mut out = Vec::with_capacity(len.min(1 << 28));
     for i in 0..len {
         let mut c = 0u32;
         for _ in 0..8 {
@@ -563,11 +572,12 @@ pub fn cm_decompress(
             pred.update(y);
             c = (c << 1) | y;
         }
-        out.push(c as u8);
+        out[i] = c as u8;
+        pred.end_byte(&out[..=i]);
         if i & 0xFFFF == 0 && !progress(i) {
-            return None;
+            return false;
         }
     }
     progress(len);
-    Some(out)
+    true
 }

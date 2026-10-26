@@ -79,7 +79,7 @@ class HelpPage extends StatelessWidget {
                       ),
                     ),
                   const SizedBox(height: 8),
-                  Text('${s.helpFormat}: .dlb (DLB1)',
+                  Text('${s.helpFormat}: .dlb (DLB2)',
                       style: t.textTheme.bodySmall
                           ?.copyWith(color: t.colorScheme.onSurfaceVariant)),
                 ],

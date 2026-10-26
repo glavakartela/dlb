@@ -32,9 +32,11 @@ class JobRunner extends ChangeNotifier {
     return Duration(seconds: ((snap.total - snap.done) / sp).round());
   }
 
-  void startCompress(List<String> paths, String out, int level) {
+  void startCompress(List<String> paths, String out, int level,
+      {int threads = 0}) {
     wasCompress = true;
-    _begin(() => DlbNative.instance.startCompress(paths, out, level));
+    _begin(() => DlbNative.instance.startCompress(paths, out, level,
+        threads: threads));
   }
 
   void startExtract(String archive, String? dest, {bool force = false}) {

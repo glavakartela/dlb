@@ -1,14 +1,17 @@
-use dlbcore::{archive, compress_payload, decompress_payload};
+use dlbcore::{all_cores, archive, auto_threads, compress_payload, decompress_payload, Options};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::exit;
 use std::time::Instant;
 
-const USAGE: &str = "dlb 0.1 - maximum-ratio context-mixing compressor (.dlb)
+const USAGE: &str = "dlb 0.4 - maximum-ratio context-mixing compressor (.dlb)
 
 USAGE:
-  dlb c [-l 1-9] [-o out.dlb] <file|dir>...   compress (default level 7 ~115 MB RAM; 4 ~25 MB; 9 ~305 MB)
-  dlb x <archive.dlb> [-C dir] [-f]           extract (-f overwrites)
+  dlb c [-l 1-9] [-t N] [-o out.dlb] <file|dir>...
+                                              compress (default level 7 ~115 MB RAM per thread;
+                                              4 ~25 MB; 9 ~305 MB). -t N = threads
+                                              (default: all cores, at most 8; 0 = all cores)
+  dlb x [-t N] <archive.dlb> [-C dir] [-f]    extract (-f overwrites)
   dlb t <archive.dlb>                         test integrity
   dlb l <archive.dlb>                         list contents
 ";
@@ -51,6 +54,8 @@ fn main() {
         "c" => {
             let mut level = 7u32;
             let mut out: Option<PathBuf> = None;
+            let mut threads = auto_threads();
+            let mut min_block = dlbcore::DEFAULT_MIN_BLOCK;
             let mut inputs = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -61,6 +66,16 @@ fn main() {
                         if !(1..=9).contains(&level) {
                             fail("level must be 1..9");
                         }
+                    }
+                    "-t" => {
+                        i += 1;
+                        let n: usize = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("bad -t"));
+                        threads = if n == 0 { all_cores() } else { n };
+                    }
+                    "-b" => {
+                        i += 1;
+                        let n: usize = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("bad -b"));
+                        min_block = n.max(1) << 20;
                     }
                     "-o" => {
                         i += 1;
@@ -78,13 +93,16 @@ fn main() {
                 n.push(".dlb");
                 PathBuf::from(n)
             });
-            let payload = archive::build_payload(&inputs).unwrap_or_else(|e| fail(&e.to_string()));
+            let (payload, boundaries) = archive::build_payload(&inputs).unwrap_or_else(|e| fail(&e.to_string()));
             if payload.len() > dlbcore::MAX_PAYLOAD {
                 fail("input is larger than 4 GiB; split it into several archives");
             }
             let t0 = Instant::now();
             let mut pg = progress("compress", payload.len());
-            let blob = compress_payload(&payload, level, &mut pg).expect("not cancellable");
+            let mut opts = Options::new(level);
+            opts.threads = threads;
+            opts.min_block = min_block;
+            let blob = compress_payload(&payload, &boundaries, &opts, &mut pg).expect("not cancellable");
             std::fs::write(&out, &blob).unwrap_or_else(|e| fail(&format!("{}: {}", out.display(), e)));
             eprintln!(
                 "{} -> {} bytes  (x{:.2})  {:.1}s  => {}",
@@ -100,6 +118,7 @@ fn main() {
             let mut arc: Option<PathBuf> = None;
             let mut dir = PathBuf::from(".");
             let mut force = false;
+            let mut threads = auto_threads();
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -108,6 +127,11 @@ fn main() {
                         dir = PathBuf::from(args.get(i).unwrap_or_else(|| fail("missing -C value")));
                     }
                     "-f" => force = true,
+                    "-t" => {
+                        i += 1;
+                        let n: usize = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("bad -t"));
+                        threads = if n == 0 { all_cores() } else { n };
+                    }
                     a => arc = Some(PathBuf::from(a)),
                 }
                 i += 1;
@@ -116,7 +140,7 @@ fn main() {
             let blob = std::fs::read(&arc).unwrap_or_else(|e| fail(&format!("{}: {}", arc.display(), e)));
             let total = u64::from_le_bytes(blob.get(6..14).map(|s| s.try_into().unwrap()).unwrap_or([0; 8])) as usize;
             let mut pg = progress("decompress", total);
-            let payload = decompress_payload(&blob, &mut pg).unwrap_or_else(|e| fail(&e));
+            let payload = decompress_payload(&blob, threads, &mut pg).unwrap_or_else(|e| fail(&e));
             let entries = archive::parse_payload(&payload).unwrap_or_else(|e| fail(&e));
             match cmd {
                 "t" => println!("OK: {} files, {} bytes, CRC verified", entries.len(), payload.len()),

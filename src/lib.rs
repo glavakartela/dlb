@@ -1,14 +1,23 @@
 //! DLB — context-mixing compressor with its own `.dlb` container format.
 //!
-//! Container layout (little endian):
+//! Container "DLB2" (little endian):
 //! ```text
-//! 0   4  magic "DLB1"
-//! 4   1  flags   (bit0 = stored / not compressed)
-//! 5   1  nbits   (log2 of context table slots; decoder needs the same value)
+//! 0   4  magic "DLB2"
+//! 4   1  flags   (reserved, 0)
+//! 5   1  reserved (0)
 //! 6   8  payload length
-//! 14  4  CRC-32 of payload
-//! 18  .. compressed (or stored) payload
+//! 14  4  CRC-32 of the whole payload
+//! 18  4  block count N
+//! 22  10*N block table: raw_len u32 | comp_len u32 | flags u8 (bit0 = stored) | nbits u8
+//! ..     block bodies back to back
 //! ```
+//! Every block is an independent context-mixing stream, so blocks are compressed and
+//! decompressed in parallel. Blocks are at least `min_block` bytes (32 MiB by default) and
+//! are cut at file boundaries when possible, so the ratio cost of splitting is negligible
+//! for large inputs (the model "cold start" costs only a few KB per block).
+//!
+//! The older single-stream "DLB1" container is still readable.
+//!
 //! The payload is a solid archive: `"DLAR"`, entry count, then per entry
 //! `name_len u16 | name | size u64 | mode u32`, followed by all file data back to back.
 
@@ -17,10 +26,19 @@ pub mod cm;
 pub mod crc32;
 pub mod ffi;
 
-pub const MAGIC: &[u8; 4] = b"DLB1";
-pub const HEADER_LEN: usize = 18;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::Mutex;
+use std::time::Duration;
+
+pub const MAGIC_V1: &[u8; 4] = b"DLB1";
+pub const MAGIC: &[u8; 4] = b"DLB2";
+const V1_HEADER: usize = 18;
+const V2_HEADER: usize = 22;
+const V2_ENTRY: usize = 10;
 /// Match tables store 32-bit positions, so one archive is limited to just under 4 GiB.
 pub const MAX_PAYLOAD: usize = 0xFFFF_0000;
+pub const DEFAULT_MIN_BLOCK: usize = 32 << 20;
+const MAX_BLOCKS: usize = 1 << 16;
 
 /// Map level 1..=9 to log2(table slots): 18 (1 MB) .. 26 (256 MB).
 pub fn level_to_nbits(level: u32, data_len: usize) -> u32 {
@@ -30,59 +48,322 @@ pub fn level_to_nbits(level: u32, data_len: usize) -> u32 {
     want.min(need.max(16))
 }
 
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// 1..=9; higher uses more memory per thread (see `level_to_nbits`).
+    pub level: u32,
+    /// Worker threads. Each one needs its own model memory.
+    pub threads: usize,
+    /// Smallest block size when splitting for threads.
+    pub min_block: usize,
+}
+
+impl Options {
+    pub fn new(level: u32) -> Self {
+        Options { level, threads: 1, min_block: DEFAULT_MIN_BLOCK }
+    }
+}
+
+/// Number of logical CPUs.
+pub fn all_cores() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Default thread count: all cores, but at most 8 (memory grows with every thread).
+pub fn auto_threads() -> usize {
+    all_cores().min(8)
+}
+
+/// Returns the end offset of every block. `boundaries` are sorted end offsets of files
+/// inside the payload; cuts prefer them so similar data stays together.
+pub fn plan_blocks(
+    total: usize,
+    boundaries: &[usize],
+    threads: usize,
+    min_block: usize,
+) -> Vec<usize> {
+    let threads = threads.max(1);
+    let min_block = min_block.max(1);
+    if threads == 1 || total <= 2 * min_block {
+        return vec![total];
+    }
+    let target = min_block.max(total.div_ceil(threads));
+    let slack = target / 4;
+    let mut ends = Vec::new();
+    let mut start = 0usize;
+    while total - start > target + slack {
+        let want = start + target;
+        let idx = boundaries.partition_point(|&b| b < want);
+        let cut = if idx < boundaries.len() && boundaries[idx] <= want + slack {
+            boundaries[idx]
+        } else if idx > 0 && boundaries[idx - 1] > start && boundaries[idx - 1] + slack >= want {
+            boundaries[idx - 1]
+        } else {
+            want
+        };
+        ends.push(cut);
+        start = cut;
+    }
+    ends.push(total);
+    ends
+}
+
+/// Runs `work(i, progress)` for i in 0..n on up to `threads` workers and returns the results
+/// in order. `sizes[i]` is the amount of progress block `i` reports in total.
+/// The calling thread reports aggregate progress through `progress`; returning false from it
+/// cancels everything (result `None`).
+fn run_blocks<T: Send>(
+    sizes: &[usize],
+    threads: usize,
+    work: &(dyn Fn(usize, &mut dyn FnMut(usize) -> bool) -> Option<T> + Sync),
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Option<Vec<T>> {
+    let n = sizes.len();
+    let workers = threads.clamp(1, n.max(1));
+    if workers == 1 {
+        let mut out = Vec::with_capacity(n);
+        let mut base = 0usize;
+        for i in 0..n {
+            let b = base;
+            out.push(work(i, &mut |d| progress(b + d))?);
+            base += sizes[i];
+        }
+        return Some(out);
+    }
+
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let alive = AtomicUsize::new(workers);
+    let cancel = AtomicBool::new(false);
+    let slots: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
+
+    std::thread::scope(|sc| {
+        for _ in 0..workers {
+            sc.spawn(|| {
+                loop {
+                    if cancel.load(SeqCst) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, SeqCst);
+                    if i >= n {
+                        break;
+                    }
+                    let mut last = 0usize;
+                    let r = work(i, &mut |d| {
+                        done.fetch_add(d - last, SeqCst);
+                        last = d;
+                        !cancel.load(SeqCst)
+                    });
+                    match r {
+                        Some(v) => *slots[i].lock().unwrap() = Some(v),
+                        None => {
+                            cancel.store(true, SeqCst);
+                            break;
+                        }
+                    }
+                }
+                alive.fetch_sub(1, SeqCst);
+            });
+        }
+        while alive.load(SeqCst) > 0 {
+            if !progress(done.load(SeqCst)) {
+                cancel.store(true, SeqCst);
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+
+    if cancel.load(SeqCst) {
+        return None;
+    }
+    progress(sizes.iter().sum());
+    slots.into_iter().map(|m| m.into_inner().unwrap()).collect()
+}
+
+struct BlockOut {
+    stored: bool,
+    nbits: u8,
+    body: Vec<u8>, // empty when stored (the raw bytes are copied from the payload)
+}
+
+/// Compresses `payload`. `boundaries` are file end offsets inside it (may be empty).
+/// `progress` receives bytes of payload processed and returns false to cancel.
 pub fn compress_payload(
     payload: &[u8],
-    level: u32,
+    boundaries: &[usize],
+    opts: &Options,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Option<Vec<u8>> {
-    let nbits = level_to_nbits(level, payload.len());
-    let body = cm::cm_compress(payload, nbits, progress)?;
-    let (flags, body): (u8, &[u8]) = if body.len() >= payload.len() {
-        (1, payload)
-    } else {
-        (0, &body)
+    let ends = plan_blocks(payload.len(), boundaries, opts.threads, opts.min_block);
+    let mut ranges = Vec::with_capacity(ends.len());
+    let mut s = 0usize;
+    for &e in &ends {
+        ranges.push((s, e));
+        s = e;
+    }
+    let sizes: Vec<usize> = ranges.iter().map(|&(a, b)| b - a).collect();
+    let level = opts.level;
+
+    let work = |i: usize, prog: &mut dyn FnMut(usize) -> bool| -> Option<BlockOut> {
+        let (a, b) = ranges[i];
+        let data = &payload[a..b];
+        let nbits = level_to_nbits(level, data.len());
+        let body = cm::cm_compress(data, nbits, prog)?;
+        Some(if body.len() >= data.len() {
+            BlockOut { stored: true, nbits: nbits as u8, body: Vec::new() }
+        } else {
+            BlockOut { stored: false, nbits: nbits as u8, body }
+        })
     };
-    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
+    let blocks = run_blocks(&sizes, opts.threads, &work, progress)?;
+
+    let body_total: usize = blocks
+        .iter()
+        .zip(&sizes)
+        .map(|(b, &raw)| if b.stored { raw } else { b.body.len() })
+        .sum();
+    let mut out = Vec::with_capacity(V2_HEADER + V2_ENTRY * blocks.len() + body_total);
     out.extend_from_slice(MAGIC);
-    out.push(flags);
-    out.push(nbits as u8);
+    out.push(0);
+    out.push(0);
     out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     out.extend_from_slice(&crc32::crc32(payload).to_le_bytes());
-    out.extend_from_slice(body);
+    out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    for (b, &raw) in blocks.iter().zip(&sizes) {
+        let comp = if b.stored { raw } else { b.body.len() };
+        out.extend_from_slice(&(raw as u32).to_le_bytes());
+        out.extend_from_slice(&(comp as u32).to_le_bytes());
+        out.push(b.stored as u8);
+        out.push(b.nbits);
+    }
+    for (b, &(a, e)) in blocks.iter().zip(&ranges) {
+        if b.stored {
+            out.extend_from_slice(&payload[a..e]);
+        } else {
+            out.extend_from_slice(&b.body);
+        }
+    }
     Some(out)
 }
 
-pub fn decompress_payload(
-    blob: &[u8],
-    progress: &mut dyn FnMut(usize) -> bool,
-) -> Result<Vec<u8>, String> {
-    if blob.len() < HEADER_LEN || &blob[0..4] != MAGIC {
+struct BlockInfo<'a> {
+    raw: usize,
+    stored: bool,
+    nbits: u32,
+    body: &'a [u8],
+}
+
+fn parse_blocks(blob: &[u8]) -> Result<(usize, u32, Vec<BlockInfo<'_>>), String> {
+    if blob.len() < 4 {
         return Err("not a DLB file (bad magic)".into());
     }
-    let flags = blob[4];
-    let nbits = blob[5] as u32;
-    if !(10..=30).contains(&nbits) {
-        return Err(format!("corrupt header: nbits={}", nbits));
-    }
-    let len = u64::from_le_bytes(blob[6..14].try_into().unwrap());
-    let crc = u32::from_le_bytes(blob[14..18].try_into().unwrap());
-    if len > (1u64 << 40) {
-        return Err("corrupt header: absurd length".into());
-    }
-    let len = len as usize;
-    let body = &blob[HEADER_LEN..];
-    // a CM stream cannot shrink data more than ~400000:1; reject absurd lengths early
-    if flags & 1 == 0 && (len as u64) > (body.len() as u64 + 8) * 400_000 {
-        return Err("corrupt header: length inconsistent with stream size".into());
-    }
-    let out = if flags & 1 != 0 {
-        if body.len() != len {
+    let corrupt = |m: &str| Err(format!("corrupt header: {}", m));
+    let check_nbits = |n: u32| (10..=30).contains(&n);
+
+    if &blob[0..4] == MAGIC_V1 {
+        if blob.len() < V1_HEADER {
+            return corrupt("truncated");
+        }
+        let stored = blob[4] & 1 != 0;
+        let nbits = blob[5] as u32;
+        let len = u64::from_le_bytes(blob[6..14].try_into().unwrap());
+        let crc = u32::from_le_bytes(blob[14..18].try_into().unwrap());
+        let body = &blob[V1_HEADER..];
+        if len > MAX_PAYLOAD as u64 {
+            return corrupt("unsupported length");
+        }
+        if !stored && !check_nbits(nbits) {
+            return corrupt("nbits");
+        }
+        if stored && body.len() as u64 != len {
             return Err("corrupt stored block".into());
         }
-        body.to_vec()
-    } else {
-        cm::cm_decompress(body, len, nbits, progress).ok_or_else(|| "cancelled".to_string())?
-    };
+        return Ok((
+            len as usize,
+            crc,
+            vec![BlockInfo { raw: len as usize, stored, nbits, body }],
+        ));
+    }
+    if &blob[0..4] != MAGIC {
+        return Err("not a DLB file (bad magic)".into());
+    }
+    if blob.len() < V2_HEADER {
+        return corrupt("truncated");
+    }
+    let total = u64::from_le_bytes(blob[6..14].try_into().unwrap());
+    let crc = u32::from_le_bytes(blob[14..18].try_into().unwrap());
+    let n = u32::from_le_bytes(blob[18..22].try_into().unwrap()) as usize;
+    if total > MAX_PAYLOAD as u64 {
+        return corrupt("unsupported length");
+    }
+    if n == 0 || n > MAX_BLOCKS || blob.len() < V2_HEADER + V2_ENTRY * n {
+        return corrupt("block table");
+    }
+    let mut pos = V2_HEADER + V2_ENTRY * n;
+    let mut raw_sum = 0usize;
+    let mut blocks = Vec::with_capacity(n);
+    for k in 0..n {
+        let e = &blob[V2_HEADER + V2_ENTRY * k..V2_HEADER + V2_ENTRY * (k + 1)];
+        let raw = u32::from_le_bytes(e[0..4].try_into().unwrap()) as usize;
+        let comp = u32::from_le_bytes(e[4..8].try_into().unwrap()) as usize;
+        let stored = e[8] & 1 != 0;
+        let nbits = e[9] as u32;
+        if pos.checked_add(comp).map_or(true, |end| end > blob.len()) {
+            return Err("truncated file".into());
+        }
+        if stored && comp != raw {
+            return Err("corrupt stored block".into());
+        }
+        if !stored && !check_nbits(nbits) {
+            return corrupt("nbits");
+        }
+        // a CM stream cannot shrink data more than ~400000:1; reject absurd lengths early
+        if !stored && (raw as u64) > (comp as u64 + 8) * 400_000 {
+            return corrupt("length inconsistent with stream size");
+        }
+        raw_sum += raw;
+        blocks.push(BlockInfo { raw, stored, nbits, body: &blob[pos..pos + comp] });
+        pos += comp;
+    }
+    if raw_sum as u64 != total {
+        return corrupt("block sizes do not add up");
+    }
+    Ok((total as usize, crc, blocks))
+}
+
+/// Decompresses a `.dlb` blob (DLB1 or DLB2) using up to `threads` workers.
+pub fn decompress_payload(
+    blob: &[u8],
+    threads: usize,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>, String> {
+    let (total, crc, blocks) = parse_blocks(blob)?;
+    let mut out = vec![0u8; total];
+    {
+        // hand every block its own disjoint slice of the output
+        let mut slots: Vec<Mutex<&mut [u8]>> = Vec::with_capacity(blocks.len());
+        let mut rest: &mut [u8] = &mut out;
+        for b in &blocks {
+            let (head, tail) = rest.split_at_mut(b.raw);
+            slots.push(Mutex::new(head));
+            rest = tail;
+        }
+        let sizes: Vec<usize> = blocks.iter().map(|b| b.raw).collect();
+        let work = |i: usize, prog: &mut dyn FnMut(usize) -> bool| -> Option<()> {
+            let b = &blocks[i];
+            let mut dst = slots[i].lock().unwrap();
+            if b.stored {
+                dst.copy_from_slice(b.body);
+                prog(b.raw);
+                Some(())
+            } else if cm::cm_decompress(b.body, &mut dst, b.nbits, prog) {
+                Some(())
+            } else {
+                None
+            }
+        };
+        run_blocks(&sizes, threads, &work, progress).ok_or_else(|| "cancelled".to_string())?;
+    }
     if crc32::crc32(&out) != crc {
         return Err("CRC mismatch: data is corrupt".into());
     }
@@ -93,18 +374,33 @@ pub fn decompress_payload(
 mod tests {
     use super::*;
 
-    fn rt(data: &[u8]) -> usize {
-        let c = compress_payload(data, 3, &mut |_| true).unwrap();
-        let d = decompress_payload(&c, &mut |_| true).unwrap();
-        assert_eq!(d, data);
-        c.len()
+    fn text(n: usize) -> Vec<u8> {
+        let mut x = 1u32;
+        let mut v = Vec::with_capacity(n);
+        while v.len() < n {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.extend_from_slice(format!("line {} value={}\n", x >> 20, x % 97).as_bytes());
+        }
+        v.truncate(n);
+        v
+    }
+
+    fn rt(data: &[u8], threads: usize, min_block: usize) -> (usize, usize) {
+        let opts = Options { level: 3, threads, min_block };
+        let c = compress_payload(data, &[], &opts, &mut |_| true).unwrap();
+        let blocks = u32::from_le_bytes(c[18..22].try_into().unwrap()) as usize;
+        for dt in [1, 3] {
+            let d = decompress_payload(&c, dt, &mut |_| true).unwrap();
+            assert_eq!(d, data);
+        }
+        (c.len(), blocks)
     }
 
     #[test]
     fn roundtrip_small() {
-        rt(b"");
-        rt(b"a");
-        rt(b"hello hello hello hello hello world");
+        rt(b"", 1, DEFAULT_MIN_BLOCK);
+        rt(b"a", 4, DEFAULT_MIN_BLOCK);
+        rt(b"hello hello hello hello hello world", 1, DEFAULT_MIN_BLOCK);
     }
 
     #[test]
@@ -116,18 +412,76 @@ mod tests {
                 (x >> 24) as u8
             })
             .collect();
-        let c = rt(&rnd);
-        assert!(c <= rnd.len() + HEADER_LEN); // stored fallback
+        let (c, _) = rt(&rnd, 1, DEFAULT_MIN_BLOCK);
+        assert!(c <= rnd.len() + V2_HEADER + V2_ENTRY); // stored fallback
         let rep = vec![b'x'; 100_000];
-        assert!(rt(&rep) < 200);
+        assert!(rt(&rep, 1, DEFAULT_MIN_BLOCK).0 < 200);
+    }
+
+    #[test]
+    fn parallel_blocks_roundtrip() {
+        let data = text(700_000);
+        let (single, nb1) = rt(&data, 1, 50_000);
+        let (multi, nb4) = rt(&data, 4, 50_000);
+        assert_eq!(nb1, 1);
+        assert!(nb4 >= 4, "expected at least 4 blocks, got {}", nb4);
+        // splitting costs only a little on this data
+        assert!(multi < single + single / 5, "single {} multi {}", single, multi);
+    }
+
+    #[test]
+    fn mixed_stored_and_compressed_blocks() {
+        let mut x = 99u32;
+        let mut data: Vec<u8> = (0..120_000)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 24) as u8
+            })
+            .collect();
+        data.extend(text(120_000));
+        let (_, nb) = rt(&data, 4, 30_000);
+        assert!(nb >= 4);
+    }
+
+    #[test]
+    fn plan_blocks_respects_boundaries() {
+        let ends = plan_blocks(1000, &[100, 300, 520, 700, 900, 1000], 4, 100);
+        assert_eq!(ends, vec![300, 520, 770, 1000]);
+        assert_eq!(plan_blocks(1000, &[], 1, 100), vec![1000]);
+        assert_eq!(plan_blocks(150, &[], 8, 100), vec![150]); // too small to split
+        assert_eq!(plan_blocks(0, &[], 8, 100), vec![0]);
+        // every plan is strictly increasing and ends at total
+        for threads in 2..9 {
+            let e = plan_blocks(10_000_003, &[], threads, 1000);
+            assert_eq!(*e.last().unwrap(), 10_000_003);
+            assert!(e.windows(2).all(|w| w[0] < w[1]));
+        }
     }
 
     #[test]
     fn detects_corruption() {
-        let mut c = compress_payload(&vec![7u8; 5000], 2, &mut |_| true).unwrap();
-        let n = c.len();
-        c[n / 2 + 1] ^= 0x55;
-        let r = decompress_payload(&c, &mut |_| true);
+        let opts = Options::new(2);
+        let mut c = compress_payload(&vec![7u8; 5000], &[], &opts, &mut |_| true).unwrap();
+        c[V2_HEADER + V2_ENTRY] ^= 0x55; // first byte of the first block body
+        let r = decompress_payload(&c, 1, &mut |_| true);
         assert!(r.is_err() || r.unwrap() != vec![7u8; 5000]);
+        // garbage and truncation
+        assert!(decompress_payload(b"nope", 1, &mut |_| true).is_err());
+        let ok = compress_payload(b"abcabcabc", &[], &opts, &mut |_| true).unwrap();
+        assert!(decompress_payload(&ok[..ok.len() - 5], 1, &mut |_| true).is_err());
+    }
+
+    #[test]
+    fn cancel_stops_work() {
+        let data = text(600_000);
+        for threads in [1, 3] {
+            let opts = Options { level: 3, threads, min_block: 50_000 };
+            let mut calls = 0;
+            let r = compress_payload(&data, &[], &opts, &mut |_| {
+                calls += 1;
+                calls < 2
+            });
+            assert!(r.is_none(), "threads={}", threads);
+        }
     }
 }

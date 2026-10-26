@@ -1,7 +1,7 @@
 //! C ABI used by the Flutter app (dart:ffi). Work runs on a background thread;
 //! the UI polls `dlb_job_poll` and may call `dlb_job_cancel`.
 
-use crate::{archive, compress_payload, decompress_payload, MAX_PAYLOAD};
+use crate::{archive, auto_threads, compress_payload, decompress_payload, Options, MAX_PAYLOAD};
 use std::ffi::{c_char, CStr, CString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
@@ -84,6 +84,7 @@ fn spawn(job: &Arc<Job>, f: impl FnOnce(&Job) + Send + 'static) -> *const Job {
 }
 
 /// Start compressing `n` paths (files or folders) into `out_path`.
+/// `threads` = 0 picks a default (all cores, at most 8).
 ///
 /// # Safety
 /// `paths` must point to `n` valid NUL-terminated UTF-8 strings.
@@ -93,6 +94,7 @@ pub unsafe extern "C" fn dlb_compress_start(
     n: usize,
     out_path: *const c_char,
     level: u32,
+    threads: u32,
 ) -> *const Job {
     let mut inputs = Vec::new();
     for i in 0..n {
@@ -107,7 +109,7 @@ pub unsafe extern "C" fn dlb_compress_start(
     };
     let job = Job::new();
     spawn(&job, move |job| {
-        let payload = match archive::build_payload(&inputs) {
+        let (payload, boundaries) = match archive::build_payload(&inputs) {
             Ok(p) => p,
             Err(e) => return job.fail(e.to_string()),
         };
@@ -124,7 +126,9 @@ pub unsafe extern "C" fn dlb_compress_start(
             SeqCst,
         );
         job.phase.store(PHASE_CODING, SeqCst);
-        let blob = compress_payload(&payload, level, &mut |d| {
+        let mut opts = Options::new(level);
+        opts.threads = if threads == 0 { auto_threads() } else { threads as usize };
+        let blob = compress_payload(&payload, &boundaries, &opts, &mut |d| {
             job.done.store(d as u64, SeqCst);
             !job.cancel.load(SeqCst)
         });
@@ -169,7 +173,7 @@ pub unsafe extern "C" fn dlb_extract_start(
         job.total.store(total, SeqCst);
         job.in_bytes.store(blob.len() as u64, SeqCst);
         job.phase.store(PHASE_CODING, SeqCst);
-        let payload = match decompress_payload(&blob, &mut |d| {
+        let payload = match decompress_payload(&blob, auto_threads(), &mut |d| {
             job.done.store(d as u64, SeqCst);
             !job.cancel.load(SeqCst)
         }) {
@@ -283,7 +287,7 @@ mod tests {
         let input = CString::new(dir.join("in").to_str().unwrap()).unwrap();
         let out = CString::new(dir.join("t.dlb").to_str().unwrap()).unwrap();
         let ptrs = [input.as_ptr()];
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out.as_ptr(), 3) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out.as_ptr(), 3, 0) };
         assert!(!job.is_null());
         let st = wait(job);
         assert_eq!(st.state, STATE_DONE);
@@ -311,7 +315,7 @@ mod tests {
         let bigp = CString::new(dir.join("big.bin").to_str().unwrap()).unwrap();
         let out2 = CString::new(dir.join("big.dlb").to_str().unwrap()).unwrap();
         let ptrs = [bigp.as_ptr()];
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 7) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 7, 1) };
         std::thread::sleep(Duration::from_millis(300));
         unsafe { dlb_job_cancel(job) };
         assert_eq!(wait(job).state, STATE_CANCELLED);
@@ -321,7 +325,7 @@ mod tests {
         // error path
         let missing = CString::new("/nonexistent/zzz").unwrap();
         let ptrs = [missing.as_ptr()];
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 3) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 3, 0) };
         assert_eq!(wait(job).state, STATE_ERROR);
         unsafe { dlb_job_free(job) };
         let _ = std::fs::remove_dir_all(&dir);

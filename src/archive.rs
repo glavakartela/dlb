@@ -50,7 +50,9 @@ fn ext_key(name: &str) -> String {
 
 /// Read all inputs and build the solid payload. Files are grouped by extension
 /// so similar data sits together (better ratio).
-pub fn build_payload(paths: &[PathBuf]) -> io::Result<Vec<u8>> {
+/// Returns the payload and the end offset of every file's data inside it
+/// (the first entry is the end of the header), used to cut parallel blocks.
+pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>)> {
     let mut srcs = Vec::new();
     for p in paths {
         let base = p
@@ -65,6 +67,7 @@ pub fn build_payload(paths: &[PathBuf]) -> io::Result<Vec<u8>> {
     head.extend_from_slice(b"DLAR");
     head.extend_from_slice(&(srcs.len() as u32).to_le_bytes());
     let mut data: Vec<u8> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::with_capacity(srcs.len());
     for s in &srcs {
         let md = fs::metadata(&s.path)?;
         let bytes = fs::read(&s.path)?;
@@ -76,10 +79,18 @@ pub fn build_payload(paths: &[PathBuf]) -> io::Result<Vec<u8>> {
         head.extend_from_slice(nb);
         head.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         head.extend_from_slice(&mode_of(&md).to_le_bytes());
+        sizes.push(bytes.len());
         data.extend_from_slice(&bytes);
     }
+    let mut boundaries = Vec::with_capacity(srcs.len() + 1);
+    let mut off = head.len();
+    boundaries.push(off);
+    for s in &sizes {
+        off += s;
+        boundaries.push(off);
+    }
     head.extend_from_slice(&data);
-    Ok(head)
+    Ok((head, boundaries))
 }
 
 pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {

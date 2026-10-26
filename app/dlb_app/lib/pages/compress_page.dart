@@ -24,6 +24,7 @@ class _CompressPageState extends State<CompressPage> {
   final JobRunner _runner = JobRunner();
   final List<String> _items = [];
   int _level = 7;
+  bool _multi = true;
   String? _customOut; // desktop "Save as" choice
   bool _dragging = false;
 
@@ -78,7 +79,8 @@ class _CompressPageState extends State<CompressPage> {
     if (_items.isEmpty) return;
     final cache = isAndroid ? (await getTemporaryDirectory()).path : null;
     final out = _customOut ?? _autoOut(cache);
-    _runner.startCompress(List.of(_items), out, _level);
+    _runner.startCompress(List.of(_items), out, _level,
+        threads: _multi ? 0 : 1);
   }
 
   Future<void> _saveCopy() async {
@@ -278,6 +280,14 @@ class _CompressPageState extends State<CompressPage> {
             const SizedBox(height: 12),
             Text(s.ramHint(_level, levelRamMb(_level)),
                 style: t.textTheme.bodyMedium),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: Text(s.multiCore),
+              subtitle: Text(s.multiCoreHint),
+              value: _multi,
+              onChanged: busy ? null : (v) => setState(() => _multi = v),
+            ),
             const SizedBox(height: 4),
             Text(s.slowNote,
                 style: t.textTheme.bodySmall

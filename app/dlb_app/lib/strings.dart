@@ -30,6 +30,10 @@ class S {
   String ramHint(int level, int mb) => t(
       'Уровень $level · около $mb МБ памяти',
       'Level $level · about $mb MB of memory');
+  String get multiCore => t('Все ядра процессора', 'Use all CPU cores');
+  String get multiCoreHint => t(
+      'Большие данные (от 64 МБ) делятся на блоки и сжимаются параллельно: быстрее в разы, ужатие чуть слабее, памяти больше.',
+      'Large data (64 MB and up) is split into blocks compressed in parallel: several times faster, slightly weaker ratio, more memory.');
   String get slowNote => t(
       'Чем сильнее сжатие, тем дольше работа: примерно 0,4 МБ/с.',
       'Stronger compression takes longer: roughly 0.4 MB/s.');
