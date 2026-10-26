@@ -9,8 +9,10 @@ import 'package:path_provider/path_provider.dart';
 import '../format.dart';
 import '../job_runner.dart';
 import '../platform.dart';
+import '../settings.dart';
 import '../strings.dart';
 import '../widgets/layout.dart';
+import '../widgets/password_field.dart';
 import '../widgets/status_panel.dart';
 
 class CompressPage extends StatefulWidget {
@@ -23,14 +25,19 @@ class CompressPage extends StatefulWidget {
 class _CompressPageState extends State<CompressPage> {
   final JobRunner _runner = JobRunner();
   final List<String> _items = [];
-  int _level = 7;
-  bool _multi = true;
+  int _level = AppSettings.level;
+  bool _multi = AppSettings.multiCore;
+  final TextEditingController _pw = TextEditingController();
+  final TextEditingController _pw2 = TextEditingController();
+  bool get _pwOk => _pw.text.isEmpty || _pw.text == _pw2.text;
   String? _customOut; // desktop "Save as" choice
   bool _dragging = false;
 
   @override
   void dispose() {
     _runner.dispose();
+    _pw.dispose();
+    _pw2.dispose();
     super.dispose();
   }
 
@@ -80,7 +87,7 @@ class _CompressPageState extends State<CompressPage> {
     final cache = isAndroid ? (await getTemporaryDirectory()).path : null;
     final out = _customOut ?? _autoOut(cache);
     _runner.startCompress(List.of(_items), out, _level,
-        threads: (_multi && _level < 10) ? 0 : 1);
+        threads: (_multi && _level < 10) ? 0 : 1, password: _pw.text);
   }
 
   Future<void> _saveCopy() async {
@@ -97,7 +104,13 @@ class _CompressPageState extends State<CompressPage> {
   void _again() {
     final done = _runner.state == RunState.done;
     _runner.reset();
-    if (done) setState(_items.clear);
+    if (done) {
+      setState(() {
+        _items.clear();
+        _pw.clear();
+        _pw2.clear();
+      });
+    }
   }
 
   Widget _drop(Widget child) {
@@ -209,6 +222,10 @@ class _CompressPageState extends State<CompressPage> {
                 padding: EdgeInsets.fromLTRB(g, 16, g, 0),
                 sliver: SliverToBoxAdapter(child: _levelCard(s, t, busy)),
               ),
+              SliverPadding(
+                padding: EdgeInsets.fromLTRB(g, 8, g, 0),
+                sliver: SliverToBoxAdapter(child: _passwordCard(s, t, busy)),
+              ),
               if (isDesktop && _items.isNotEmpty)
                 SliverPadding(
                   padding: EdgeInsets.fromLTRB(g, 8, g, 0),
@@ -236,7 +253,7 @@ class _CompressPageState extends State<CompressPage> {
                 sliver: SliverToBoxAdapter(
                   child: _runner.state == RunState.idle
                       ? FilledButton.icon(
-                          onPressed: _items.isEmpty ? null : _start,
+                          onPressed: (_items.isEmpty || !_pwOk) ? null : _start,
                           icon: const Icon(Icons.compress),
                           label: Text(s.startCompress),
                         )
@@ -251,6 +268,40 @@ class _CompressPageState extends State<CompressPage> {
           );
         });
       },
+    );
+  }
+
+  Widget _passwordCard(S s, ThemeData t, bool busy) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            PasswordField(
+              controller: _pw,
+              label: s.passwordOptional,
+              enabled: !busy,
+              helperText: s.passwordHelp,
+              onChanged: (v) => setState(() {
+                if (v.isEmpty) _pw2.clear();
+              }),
+            ),
+            if (_pw.text.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              PasswordField(
+                controller: _pw2,
+                label: s.repeatPassword,
+                enabled: !busy,
+                errorText: (_pw2.text.isNotEmpty && !_pwOk)
+                    ? s.passwordMismatch
+                    : null,
+                onChanged: (_) => setState(() {}),
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 
@@ -274,8 +325,13 @@ class _CompressPageState extends State<CompressPage> {
                   ButtonSegment(value: 10, label: Text(s.ultra)),
                 ],
                 selected: {_level},
-                onSelectionChanged:
-                    busy ? null : (v) => setState(() => _level = v.first),
+                onSelectionChanged: busy
+                    ? null
+                    : (v) => setState(() {
+                          _level = v.first;
+                          AppSettings.level = _level;
+                          AppSettings.save();
+                        }),
               ),
             ),
             const SizedBox(height: 12),
@@ -288,7 +344,13 @@ class _CompressPageState extends State<CompressPage> {
               subtitle: Text(s.multiCoreHint),
               value: _multi,
               onChanged:
-                  (busy || _level >= 10) ? null : (v) => setState(() => _multi = v),
+                  (busy || _level >= 10)
+                      ? null
+                      : (v) => setState(() {
+                            _multi = v;
+                            AppSettings.multiCore = v;
+                            AppSettings.save();
+                          }),
             ),
             if (_level >= 10) ...[
               const SizedBox(height: 8),

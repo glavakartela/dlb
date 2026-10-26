@@ -4,11 +4,13 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 
 import 'locale_controller.dart';
 import 'pages/shell.dart';
+import 'settings.dart';
 import 'theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await localeController.load();
+  await AppSettings.load();
   runApp(const DlbApp());
 }
 
@@ -31,7 +33,14 @@ class DlbApp extends StatelessWidget {
             darkTheme: theme,
             themeMode: ThemeMode.dark, // the OLED-black design is dark only
             locale: locale,
-            supportedLocales: const [Locale('en'), Locale('ru')],
+            supportedLocales: const [
+              Locale('en'),
+              Locale('ru'),
+              Locale('uk'),
+              Locale('de'),
+              Locale('es'),
+              Locale('zh'),
+            ],
             localizationsDelegates: const [
               GlobalMaterialLocalizations.delegate,
               GlobalWidgetsLocalizations.delegate,

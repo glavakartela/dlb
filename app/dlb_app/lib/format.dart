@@ -22,9 +22,9 @@ String fmtRatio(num original, num compressed) {
   return '×${r.toStringAsFixed(2)}';
 }
 
-String fmtDuration(Duration d) {
+String fmtDuration(Duration d, {String sec = 's'}) {
   final s = d.inSeconds;
-  if (s < 60) return '$s с';
+  if (s < 60) return '$s $sec';
   final m = s ~/ 60;
   if (m < 60) return '$m:${(s % 60).toString().padLeft(2, '0')}';
   return '${m ~/ 60}:${(m % 60).toString().padLeft(2, '0')}:${(s % 60).toString().padLeft(2, '0')}';

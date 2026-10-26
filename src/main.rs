@@ -1,4 +1,4 @@
-use dlbcore::{all_cores, archive, auto_threads, compress_payload, decompress_payload, Options};
+use dlbcore::{crypto, all_cores, archive, auto_threads, compress_payload, decompress_payload, Options};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::exit;
@@ -7,15 +7,32 @@ use std::time::Instant;
 const USAGE: &str = "dlb 0.4 - maximum-ratio context-mixing compressor (.dlb)
 
 USAGE:
-  dlb c [-l 1-10] [-t N] [-o out.dlb] <file|dir>...
+  dlb c [-l 1-10] [-t N] [-p PASS] [-o out.dlb] <file|dir>...
                                               compress (default level 7 ~115 MB RAM per thread;
                                               4 ~25 MB; 9 ~305 MB; 10 = ULTRA, strongest and slowest, ~600 MB+). -t N = threads
                                               (default: all cores, at most 8; 0 = all cores;
                                               level 10 defaults to 1 thread)
-  dlb x [-t N] <archive.dlb> [-C dir] [-f]    extract (-f overwrites)
-  dlb t <archive.dlb>                         test integrity
-  dlb l <archive.dlb>                         list contents
+  dlb x [-t N] [-p PASS] <archive.dlb> [-C dir] [-f]
+                                              extract (-f overwrites)
+  dlb t [-p PASS] <archive.dlb>               test integrity
+  dlb l [-p PASS] <archive.dlb>               list contents
+
+-p PASS encrypts (c) or decrypts (x/t/l) with a password; names and sizes are hidden too.
+The DLB_PASSWORD environment variable works the same and keeps it out of `ps`. An encrypted
+archive without a password asks for one on stdin (the input is visible).
 ";
+
+fn password_from(arg: Option<String>) -> Option<String> {
+    arg.or_else(|| std::env::var("DLB_PASSWORD").ok()).filter(|p| !p.is_empty())
+}
+
+fn ask_password() -> String {
+    eprint!("password: ");
+    let _ = std::io::stderr().flush();
+    let mut s = String::new();
+    let _ = std::io::stdin().read_line(&mut s);
+    s.trim_end_matches(['\r', '\n']).to_string()
+}
 
 fn fail(msg: &str) -> ! {
     eprintln!("dlb: {}", msg);
@@ -56,6 +73,7 @@ fn main() {
             let mut level = 7u32;
             let mut out: Option<PathBuf> = None;
             let mut threads: Option<usize> = None;
+            let mut pw_arg: Option<String> = None;
             let mut min_block = dlbcore::DEFAULT_MIN_BLOCK;
             let mut inputs = Vec::new();
             let mut i = 1;
@@ -72,6 +90,10 @@ fn main() {
                         i += 1;
                         let n: usize = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("bad -t"));
                         threads = Some(if n == 0 { all_cores() } else { n });
+                    }
+                    "-p" => {
+                        i += 1;
+                        pw_arg = Some(args.get(i).cloned().unwrap_or_else(|| fail("missing -p value")));
                     }
                     "-b" => {
                         i += 1;
@@ -105,6 +127,10 @@ fn main() {
             opts.threads = threads.unwrap_or(if level >= 10 { 1 } else { auto_threads() });
             opts.min_block = min_block;
             let blob = compress_payload(&payload, &boundaries, &opts, &mut pg).expect("not cancellable");
+            let blob = match password_from(pw_arg) {
+                Some(pw) => crypto::seal(&blob, &pw).unwrap_or_else(|e| fail(&e)),
+                None => blob,
+            };
             std::fs::write(&out, &blob).unwrap_or_else(|e| fail(&format!("{}: {}", out.display(), e)));
             eprintln!(
                 "{} -> {} bytes  (x{:.2})  {:.1}s  => {}",
@@ -120,6 +146,7 @@ fn main() {
             let mut arc: Option<PathBuf> = None;
             let mut dir = PathBuf::from(".");
             let mut force = false;
+            let mut pw_arg: Option<String> = None;
             let mut threads = auto_threads();
             let mut i = 1;
             while i < args.len() {
@@ -129,6 +156,10 @@ fn main() {
                         dir = PathBuf::from(args.get(i).unwrap_or_else(|| fail("missing -C value")));
                     }
                     "-f" => force = true,
+                    "-p" => {
+                        i += 1;
+                        pw_arg = Some(args.get(i).cloned().unwrap_or_else(|| fail("missing -p value")));
+                    }
                     "-t" => {
                         i += 1;
                         let n: usize = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("bad -t"));
@@ -140,6 +171,13 @@ fn main() {
             }
             let arc = arc.unwrap_or_else(|| fail("no archive given"));
             let blob = std::fs::read(&arc).unwrap_or_else(|e| fail(&format!("{}: {}", arc.display(), e)));
+            let blob = if crypto::is_encrypted(&blob) {
+                let pw = password_from(pw_arg).unwrap_or_else(ask_password);
+                eprintln!("decrypting...");
+                crypto::open(&blob, &pw).unwrap_or_else(|e| fail(&e))
+            } else {
+                blob
+            };
             let total = u64::from_le_bytes(blob.get(6..14).map(|s| s.try_into().unwrap()).unwrap_or([0; 8])) as usize;
             let mut pg = progress("decompress", total);
             let payload = decompress_payload(&blob, threads, &mut pg).unwrap_or_else(|e| fail(&e));

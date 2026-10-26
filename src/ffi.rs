@@ -1,12 +1,15 @@
 //! C ABI used by the Flutter app (dart:ffi). Work runs on a background thread;
 //! the UI polls `dlb_job_poll` and may call `dlb_job_cancel`.
 
-use crate::{archive, auto_threads, compress_payload, decompress_payload, Options, MAX_PAYLOAD};
+use crate::{archive, auto_threads, crypto, compress_payload, decompress_payload, Options, MAX_PAYLOAD};
 use std::ffi::{c_char, CStr, CString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+/// Message of a failed extract job when the archive is encrypted and no password was given.
+pub const PASSWORD_REQUIRED: &str = "password required";
 
 pub const STATE_RUNNING: u32 = 0;
 pub const STATE_DONE: u32 = 1;
@@ -84,7 +87,7 @@ fn spawn(job: &Arc<Job>, f: impl FnOnce(&Job) + Send + 'static) -> *const Job {
 }
 
 /// Start compressing `n` paths (files or folders) into `out_path`.
-/// `threads` = 0 picks a default (all cores, at most 8).
+/// `threads` = 0 picks a default (all cores, at most 8). `password` may be NULL.
 ///
 /// # Safety
 /// `paths` must point to `n` valid NUL-terminated UTF-8 strings.
@@ -95,7 +98,10 @@ pub unsafe extern "C" fn dlb_compress_start(
     out_path: *const c_char,
     level: u32,
     threads: u32,
+    password: *const c_char,
 ) -> *const Job {
+    // NULL or empty = no encryption
+    let password = cstr(password).filter(|p| !p.is_empty());
     let mut inputs = Vec::new();
     for i in 0..n {
         match cstr(*paths.add(i)) {
@@ -136,6 +142,13 @@ pub unsafe extern "C" fn dlb_compress_start(
             Some(b) => b,
             None => return job.fail("cancelled".into()),
         };
+        let blob = match &password {
+            Some(pw) => match crypto::seal(&blob, pw) {
+                Ok(b) => b,
+                Err(e) => return job.fail(e),
+            },
+            None => blob,
+        };
         job.phase.store(PHASE_WRITING, SeqCst);
         job.out_bytes.store(blob.len() as u64, SeqCst);
         match std::fs::write(&out, &blob) {
@@ -154,7 +167,9 @@ pub unsafe extern "C" fn dlb_extract_start(
     archive_path: *const c_char,
     dest: *const c_char,
     force: u8,
+    password: *const c_char,
 ) -> *const Job {
+    let password = cstr(password);
     let arc = match cstr(archive_path) {
         Some(s) => PathBuf::from(s),
         None => return std::ptr::null(),
@@ -165,6 +180,18 @@ pub unsafe extern "C" fn dlb_extract_start(
         let blob = match std::fs::read(&arc) {
             Ok(b) => b,
             Err(e) => return job.fail(format!("{}: {}", arc.display(), e)),
+        };
+        let blob = if crypto::is_encrypted(&blob) {
+            let pw = match &password {
+                Some(p) if !p.is_empty() => p,
+                _ => return job.fail(PASSWORD_REQUIRED.into()),
+            };
+            match crypto::open(&blob, pw) {
+                Ok(b) => b,
+                Err(e) => return job.fail(e),
+            }
+        } else {
+            blob
         };
         let total = blob
             .get(6..14)
@@ -254,9 +281,26 @@ pub unsafe extern "C" fn dlb_string_free(s: *mut c_char) {
     }
 }
 
+/// Looks at the first bytes of a file: 0 = unreadable or not a DLB file, 1 = plain archive,
+/// 2 = password protected.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn dlb_probe(path: *const c_char) -> u32 {
+    use std::io::Read;
+    let Some(p) = cstr(path) else { return 0 };
+    let mut head = [0u8; 4];
+    match std::fs::File::open(p).and_then(|mut f| f.read_exact(&mut head)) {
+        Ok(()) if &head == crate::MAGIC || &head == crate::MAGIC_V1 => 1,
+        Ok(()) if &head == crypto::MAGIC_ENC => 2,
+        _ => 0,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn dlb_version() -> u32 {
-    1
+    2
 }
 
 #[cfg(test)]
@@ -287,7 +331,7 @@ mod tests {
         let input = CString::new(dir.join("in").to_str().unwrap()).unwrap();
         let out = CString::new(dir.join("t.dlb").to_str().unwrap()).unwrap();
         let ptrs = [input.as_ptr()];
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out.as_ptr(), 3, 0) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out.as_ptr(), 3, 0, std::ptr::null()) };
         assert!(!job.is_null());
         let st = wait(job);
         assert_eq!(st.state, STATE_DONE);
@@ -296,17 +340,46 @@ mod tests {
         unsafe { dlb_job_free(job) };
 
         let dest = CString::new(dir.join("out").to_str().unwrap()).unwrap();
-        let job = unsafe { dlb_extract_start(out.as_ptr(), dest.as_ptr(), 0) };
+        let job = unsafe { dlb_extract_start(out.as_ptr(), dest.as_ptr(), 0, std::ptr::null()) };
         assert_eq!(wait(job).state, STATE_DONE);
         unsafe { dlb_job_free(job) };
         assert_eq!(std::fs::read_to_string(dir.join("out/in/a.txt")).unwrap(), text);
 
         // verify-only
-        let job = unsafe { dlb_extract_start(out.as_ptr(), std::ptr::null(), 0) };
+        let job = unsafe { dlb_extract_start(out.as_ptr(), std::ptr::null(), 0, std::ptr::null()) };
         assert_eq!(wait(job).state, STATE_DONE);
         let m = unsafe { dlb_job_message(job) };
         assert_eq!(unsafe { CStr::from_ptr(m) }.to_str().unwrap(), "verified");
         unsafe { dlb_string_free(m) };
+        unsafe { dlb_job_free(job) };
+
+        // password protected archive
+        let enc = CString::new(dir.join("enc.dlb").to_str().unwrap()).unwrap();
+        let pw = CString::new("s3cret pass").unwrap();
+        let bad = CString::new("nope").unwrap();
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, enc.as_ptr(), 3, 0, pw.as_ptr()) };
+        assert_eq!(wait(job).state, STATE_DONE);
+        unsafe { dlb_job_free(job) };
+        assert_eq!(unsafe { dlb_probe(enc.as_ptr()) }, 2);
+        assert_eq!(unsafe { dlb_probe(out.as_ptr()) }, 1);
+        let raw = std::fs::read(dir.join("enc.dlb")).unwrap();
+        assert!(!raw.windows(5).any(|w| w == b"a.txt"), "names must be hidden");
+        let msg_of = |job| {
+            let m = unsafe { dlb_job_message(job) };
+            let s = unsafe { CStr::from_ptr(m) }.to_str().unwrap().to_string();
+            unsafe { dlb_string_free(m) };
+            s
+        };
+        let job = unsafe { dlb_extract_start(enc.as_ptr(), std::ptr::null(), 0, std::ptr::null()) };
+        assert_eq!(wait(job).state, STATE_ERROR);
+        assert_eq!(msg_of(job), PASSWORD_REQUIRED);
+        unsafe { dlb_job_free(job) };
+        let job = unsafe { dlb_extract_start(enc.as_ptr(), std::ptr::null(), 0, bad.as_ptr()) };
+        assert_eq!(wait(job).state, STATE_ERROR);
+        assert_eq!(msg_of(job), crypto::ERR_BAD_PASSWORD);
+        unsafe { dlb_job_free(job) };
+        let job = unsafe { dlb_extract_start(enc.as_ptr(), std::ptr::null(), 0, pw.as_ptr()) };
+        assert_eq!(wait(job).state, STATE_DONE);
         unsafe { dlb_job_free(job) };
 
         // cancel a big job right away
@@ -315,7 +388,7 @@ mod tests {
         let bigp = CString::new(dir.join("big.bin").to_str().unwrap()).unwrap();
         let out2 = CString::new(dir.join("big.dlb").to_str().unwrap()).unwrap();
         let ptrs = [bigp.as_ptr()];
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 7, 1) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 7, 1, std::ptr::null()) };
         std::thread::sleep(Duration::from_millis(300));
         unsafe { dlb_job_cancel(job) };
         assert_eq!(wait(job).state, STATE_CANCELLED);
@@ -325,7 +398,7 @@ mod tests {
         // error path
         let missing = CString::new("/nonexistent/zzz").unwrap();
         let ptrs = [missing.as_ptr()];
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 3, 0) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 3, 0, std::ptr::null()) };
         assert_eq!(wait(job).state, STATE_ERROR);
         unsafe { dlb_job_free(job) };
         let _ = std::fs::remove_dir_all(&dir);

@@ -50,13 +50,15 @@ class JobSnapshot {
 }
 
 typedef _CompressStartC = Pointer<Void> Function(
-    Pointer<Pointer<Utf8>>, IntPtr, Pointer<Utf8>, Uint32, Uint32);
+    Pointer<Pointer<Utf8>>, IntPtr, Pointer<Utf8>, Uint32, Uint32, Pointer<Utf8>);
 typedef _CompressStart = Pointer<Void> Function(
-    Pointer<Pointer<Utf8>>, int, Pointer<Utf8>, int, int);
+    Pointer<Pointer<Utf8>>, int, Pointer<Utf8>, int, int, Pointer<Utf8>);
 typedef _ExtractStartC = Pointer<Void> Function(
-    Pointer<Utf8>, Pointer<Utf8>, Uint8);
+    Pointer<Utf8>, Pointer<Utf8>, Uint8, Pointer<Utf8>);
 typedef _ExtractStart = Pointer<Void> Function(
-    Pointer<Utf8>, Pointer<Utf8>, int);
+    Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Utf8>);
+typedef _ProbeC = Uint32 Function(Pointer<Utf8>);
+typedef _Probe = int Function(Pointer<Utf8>);
 typedef _PollC = Void Function(Pointer<Void>, Pointer<JobStatusNative>);
 typedef _Poll = void Function(Pointer<Void>, Pointer<JobStatusNative>);
 typedef _MessageC = Pointer<Utf8> Function(Pointer<Void>);
@@ -72,6 +74,7 @@ class DlbNative {
             lib.lookupFunction<_CompressStartC, _CompressStart>('dlb_compress_start'),
         _extract =
             lib.lookupFunction<_ExtractStartC, _ExtractStart>('dlb_extract_start'),
+        _probe = lib.lookupFunction<_ProbeC, _Probe>('dlb_probe'),
         _poll = lib.lookupFunction<_PollC, _Poll>('dlb_job_poll'),
         _message = lib.lookupFunction<_MessageC, _Message>('dlb_job_message'),
         _cancel = lib.lookupFunction<_VoidPtrC, _VoidPtr>('dlb_job_cancel'),
@@ -80,6 +83,7 @@ class DlbNative {
 
   final _CompressStart _compress;
   final _ExtractStart _extract;
+  final _Probe _probe;
   final _Poll _poll;
   final _Message _message;
   final _VoidPtr _cancel;
@@ -107,17 +111,20 @@ class DlbNative {
 
   /// Returns null when the arguments were rejected by the core.
   NativeJob? startCompress(List<String> paths, String outPath, int level,
-      {int threads = 0}) {
+      {int threads = 0, String? password}) {
     final arr = calloc<Pointer<Utf8>>(paths.length);
     final strs = <Pointer<Utf8>>[];
     final out = outPath.toNativeUtf8();
+    final pw = (password == null || password.isEmpty)
+        ? null
+        : password.toNativeUtf8();
     try {
       for (var i = 0; i < paths.length; i++) {
         final p = paths[i].toNativeUtf8();
         strs.add(p);
         arr[i] = p;
       }
-      final h = _compress(arr, paths.length, out, level, threads);
+      final h = _compress(arr, paths.length, out, level, threads, pw ?? nullptr);
       return h == nullptr ? null : NativeJob._(this, h);
     } finally {
       // the core copies all strings before returning
@@ -126,19 +133,35 @@ class DlbNative {
       }
       calloc.free(arr);
       calloc.free(out);
+      if (pw != null) calloc.free(pw);
     }
   }
 
   /// [dest] == null only verifies integrity.
-  NativeJob? startExtract(String archive, String? dest, {bool force = false}) {
+  NativeJob? startExtract(String archive, String? dest,
+      {bool force = false, String? password}) {
     final a = archive.toNativeUtf8();
     final d = dest?.toNativeUtf8();
+    final pw = (password == null || password.isEmpty)
+        ? null
+        : password.toNativeUtf8();
     try {
-      final h = _extract(a, d ?? nullptr, force ? 1 : 0);
+      final h = _extract(a, d ?? nullptr, force ? 1 : 0, pw ?? nullptr);
       return h == nullptr ? null : NativeJob._(this, h);
     } finally {
       calloc.free(a);
       if (d != null) calloc.free(d);
+      if (pw != null) calloc.free(pw);
+    }
+  }
+
+  /// 0 = not a DLB file / unreadable, 1 = plain archive, 2 = password protected.
+  int probe(String path) {
+    final a = path.toNativeUtf8();
+    try {
+      return _probe(a);
+    } finally {
+      calloc.free(a);
     }
   }
 }

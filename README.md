@@ -11,10 +11,10 @@ and decompressed on all CPU cores in parallel.
 ## Command line
 
 ```
-dlb c [-l 1-10] [-t N] [-o out.dlb] <file|dir>...   compress  (level 7 default: ~115 MB RAM per thread; 4: ~25 MB; 9: ~305 MB)
-dlb x [-t N] <archive.dlb> [-C dir] [-f]           extract   (-f overwrites existing files)
-dlb t <archive.dlb>                         test integrity (CRC-32)
-dlb l <archive.dlb>                         list contents
+dlb c [-l 1-10] [-t N] [-p PASS] [-o out.dlb] <file|dir>...   compress  (level 7 default: ~115 MB RAM per thread; 4: ~25 MB; 9: ~305 MB)
+dlb x [-t N] [-p PASS] <archive.dlb> [-C dir] [-f]           extract   (-f overwrites existing files)
+dlb t [-p PASS] <archive.dlb>               test integrity (CRC-32)
+dlb l [-p PASS] <archive.dlb>               list contents
 ```
 
 `-t N` sets the thread count (default: all cores, at most 8; `-t 0` = all cores, `-t 1` = single
@@ -51,6 +51,23 @@ large (about 550 MB). It is the strongest the program can do and is meant for a 
 versus level 7: source code -2%, executables -2.7%, text logs -14%, at about 1.6x the time.
 Gains are small on already tight data and large on structured, repetitive text.
 
+### Password protection
+
+`dlb c -p PASS ...` (or the `DLB_PASSWORD` environment variable, which keeps the password out of
+`ps`) encrypts the finished archive. File names and sizes are hidden as well. Without `-p`, an
+encrypted archive asks for the password on stdin. The app has the same option (repeat-password
+field, and a password prompt when you open a protected archive).
+
+- ChaCha20 stream cipher, HMAC-SHA256 tag (encrypt-then-MAC), key from PBKDF2-HMAC-SHA256 with a
+  random 16-byte salt and 300,000 iterations; random 12-byte nonce.
+- A wrong password and a modified file are both reported as "wrong password or damaged archive".
+- Written from scratch with no dependencies and checked against the RFC 8439 / RFC 4231 / PBKDF2
+  test vectors, but **not audited by third parties**. For highly sensitive data, also use a
+  well-known tool. A forgotten password cannot be recovered.
+
+Envelope (`DLBE`): magic, version `1`, iterations u32, salt 16, nonce 12, ciphertext (a complete
+`DLB2` file), tag 32.
+
 ### Parallel mode: speed vs. ratio
 
 The solid payload (files sorted by extension) is cut into blocks of at least 32 MiB, at file
@@ -77,7 +94,7 @@ A native-feeling UI over the same core, designed with the ui-ux-pro-max guidelin
 - touch targets of at least 48 dp, labels and semantics for screen readers, reduced-motion aware
 - bottom navigation bar on phones, navigation rail on wide windows, content width capped at 640 px
 - vector icons only
-- **English by default**; Russian can be selected on the Help page (the choice is remembered)
+- **English by default**; also Russian, Ukrainian, German, Spanish and Chinese (Help page; the choice is remembered, as are the level and the multi-core switch)
 
 Screens: **Compress** (files or folder, drag and drop on desktop, three presets, progress with
 speed and ETA, cancel), **Extract** (with integrity check), **Help**.

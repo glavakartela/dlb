@@ -41,7 +41,7 @@ class StatusPanel extends StatelessWidget {
             key: const ValueKey('err'),
             error: true,
             title: S.of(context).error,
-            body: runner.message,
+            body: S.of(context).errorText(runner.message),
             onAgain: onAgain),
         RunState.cancelled => _Message(
             key: const ValueKey('cancel'),
@@ -75,9 +75,9 @@ class _Progress extends StatelessWidget {
     final sp = runner.speed;
     final detail = [
       if (snap.total > 0)
-        '${fmtBytes(snap.done, ru: s.ru)} / ${fmtBytes(snap.total, ru: s.ru)}',
-      if (sp > 0) s.speed(fmtBytes(sp, ru: s.ru)),
-      if (eta != null) s.eta(fmtDuration(eta)),
+        '${fmtBytes(snap.done, ru: s.cyr)} / ${fmtBytes(snap.total, ru: s.cyr)}',
+      if (sp > 0) s.speed(fmtBytes(sp, ru: s.cyr)),
+      if (eta != null) s.eta(fmtDuration(eta, sec: s.secUnit)),
     ].join(' · ');
 
     return Card(
@@ -155,11 +155,11 @@ class _Result extends StatelessWidget {
       final saved = snap.inBytes == 0
           ? 0
           : ((1 - snap.outBytes / snap.inBytes) * 100).clamp(0, 100).round();
-      sub = '${fmtBytes(snap.inBytes, ru: s.ru)} → ${fmtBytes(snap.outBytes, ru: s.ru)}'
+      sub = '${fmtBytes(snap.inBytes, ru: s.cyr)} → ${fmtBytes(snap.outBytes, ru: s.cyr)}'
           ' · $saved% ${s.savedSpace} · ${s.filesCount(snap.files)}';
     } else {
       headline = s.done;
-      sub = '${s.filesCount(snap.files)} · ${fmtBytes(snap.outBytes, ru: s.ru)}';
+      sub = '${s.filesCount(snap.files)} · ${fmtBytes(snap.outBytes, ru: s.cyr)}';
     }
 
     return Card(

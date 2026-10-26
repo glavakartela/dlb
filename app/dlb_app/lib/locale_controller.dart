@@ -4,6 +4,16 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+/// Languages offered in the app: code -> name in that language.
+const Map<String, String> kLanguages = {
+  'en': 'English',
+  'ru': 'Русский',
+  'uk': 'Українська',
+  'de': 'Deutsch',
+  'es': 'Español',
+  'zh': '中文',
+};
+
 /// App language. English is the default (it does not follow the system language);
 /// the user's choice is remembered in a tiny file in the app support directory.
 class LocaleController extends ValueNotifier<Locale> {
@@ -19,7 +29,7 @@ class LocaleController extends ValueNotifier<Locale> {
       final f = await _file();
       if (await f.exists()) {
         final code = (await f.readAsString()).trim();
-        if (code == 'en' || code == 'ru') value = Locale(code);
+        if (kLanguages.containsKey(code)) value = Locale(code);
       }
     } catch (_) {
       // keep the default

@@ -7,9 +7,11 @@ import 'package:path_provider/path_provider.dart';
 
 import '../format.dart';
 import '../job_runner.dart';
+import '../native/dlb_native.dart';
 import '../platform.dart';
 import '../strings.dart';
 import '../widgets/layout.dart';
+import '../widgets/password_field.dart';
 import '../widgets/status_panel.dart';
 
 class ExtractPage extends StatefulWidget {
@@ -25,10 +27,14 @@ class _ExtractPageState extends State<ExtractPage> {
   int _archiveSize = 0;
   String? _dest;
   bool _force = false;
+  bool _encrypted = false;
+  final TextEditingController _pw = TextEditingController();
+  bool get _needPw => _encrypted && _pw.text.isEmpty;
 
   @override
   void dispose() {
     _runner.dispose();
+    _pw.dispose();
     super.dispose();
   }
 
@@ -43,7 +49,15 @@ class _ExtractPageState extends State<ExtractPage> {
     final base = isAndroid
         ? (await getApplicationDocumentsDirectory()).path
         : p.dirname(path);
+    var kind = 1;
+    try {
+      kind = DlbNative.instance.probe(path);
+    } catch (_) {
+      // library problems surface when the job starts
+    }
+    _pw.clear();
     setState(() {
+      _encrypted = kind == 2;
       _archive = path;
       _archiveSize = File(path).lengthSync();
       _dest = p.join(base, p.basenameWithoutExtension(path));
@@ -56,10 +70,11 @@ class _ExtractPageState extends State<ExtractPage> {
     if (d != null) setState(() => _dest = d);
   }
 
-  void _extract() =>
-      _runner.startExtract(_archive!, _dest, force: _force);
+  void _extract() => _runner.startExtract(_archive!, _dest,
+      force: _force, password: _encrypted ? _pw.text : null);
 
-  void _verify() => _runner.startExtract(_archive!, null);
+  void _verify() => _runner.startExtract(_archive!, null,
+      password: _encrypted ? _pw.text : null);
 
   @override
   Widget build(BuildContext context) {
@@ -100,7 +115,7 @@ class _ExtractPageState extends State<ExtractPage> {
                 PathTile(
                   icon: Icons.inventory_2_outlined,
                   title: p.basename(_archive!),
-                  subtitle: fmtBytes(_archiveSize, ru: s.ru),
+                  subtitle: fmtBytes(_archiveSize, ru: s.cyr),
                   removeLabel: s.change,
                   onRemove: busy
                       ? null
@@ -121,6 +136,38 @@ class _ExtractPageState extends State<ExtractPage> {
                     child: TextButton(
                         onPressed: _pickDest, child: Text(s.change)),
                   ),
+                if (_encrypted) ...[
+                  const SizedBox(height: 8),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(20),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(children: [
+                            Icon(Icons.lock_outline,
+                                color: t.colorScheme.primary),
+                            const SizedBox(width: 12),
+                            Expanded(
+                                child: Text(s.encryptedArchive,
+                                    style: t.textTheme.titleMedium)),
+                          ]),
+                          const SizedBox(height: 12),
+                          PasswordField(
+                            controller: _pw,
+                            label: s.password,
+                            enabled: !busy,
+                            helperText: s.enterPassword,
+                            onChanged: (_) => setState(() {}),
+                            onSubmitted: (_) {
+                              if (idle && !_needPw) _extract();
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 8),
                 Card(
                   color: t.colorScheme.surfaceContainer,
@@ -135,13 +182,13 @@ class _ExtractPageState extends State<ExtractPage> {
                 const SizedBox(height: 16),
                 if (idle) ...[
                   FilledButton.icon(
-                    onPressed: _extract,
+                    onPressed: _needPw ? null : _extract,
                     icon: const Icon(Icons.unarchive),
                     label: Text(s.startExtract),
                   ),
                   const SizedBox(height: 12),
                   OutlinedButton.icon(
-                    onPressed: _verify,
+                    onPressed: _needPw ? null : _verify,
                     icon: const Icon(Icons.verified_outlined),
                     label: Text(s.verify),
                   ),

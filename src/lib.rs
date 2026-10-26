@@ -22,6 +22,7 @@
 //! `name_len u16 | name | size u64 | mode u32`, followed by all file data back to back.
 
 pub mod archive;
+pub mod crypto;
 pub mod cm;
 pub mod crc32;
 pub mod ffi;

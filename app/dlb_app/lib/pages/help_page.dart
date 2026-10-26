@@ -27,18 +27,17 @@ class HelpPage extends StatelessWidget {
                 children: [
                   Text(s.language, style: t.textTheme.titleMedium),
                   const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: SegmentedButton<String>(
-                      showSelectedIcon: false,
-                      segments: const [
-                        ButtonSegment(value: 'en', label: Text('English')),
-                        ButtonSegment(value: 'ru', label: Text('Русский')),
-                      ],
-                      selected: {s.ru ? 'ru' : 'en'},
-                      onSelectionChanged: (v) =>
-                          localeController.select(v.first),
-                    ),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final e in kLanguages.entries)
+                        ChoiceChip(
+                          label: Text(e.value),
+                          selected: s.code == e.key,
+                          onSelected: (_) => localeController.select(e.key),
+                        ),
+                    ],
                   ),
                 ],
               ),
@@ -50,6 +49,8 @@ class HelpPage extends StatelessWidget {
           _Info(Icons.trending_down, s.helpGoodTitle, s.helpGood),
           const SizedBox(height: 8),
           _Info(Icons.block, s.helpBadTitle, s.helpBad),
+          const SizedBox(height: 8),
+          _Info(Icons.lock_outline, s.helpSecurityTitle, s.helpSecurity),
           const SizedBox(height: 8),
           _Info(Icons.info_outline, s.helpLimitsTitle, s.helpLimits),
           const SizedBox(height: 8),
