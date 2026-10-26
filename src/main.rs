@@ -7,10 +7,11 @@ use std::time::Instant;
 const USAGE: &str = "dlb 0.4 - maximum-ratio context-mixing compressor (.dlb)
 
 USAGE:
-  dlb c [-l 1-9] [-t N] [-o out.dlb] <file|dir>...
+  dlb c [-l 1-10] [-t N] [-o out.dlb] <file|dir>...
                                               compress (default level 7 ~115 MB RAM per thread;
-                                              4 ~25 MB; 9 ~305 MB). -t N = threads
-                                              (default: all cores, at most 8; 0 = all cores)
+                                              4 ~25 MB; 9 ~305 MB; 10 = ULTRA, strongest and slowest, ~600 MB+). -t N = threads
+                                              (default: all cores, at most 8; 0 = all cores;
+                                              level 10 defaults to 1 thread)
   dlb x [-t N] <archive.dlb> [-C dir] [-f]    extract (-f overwrites)
   dlb t <archive.dlb>                         test integrity
   dlb l <archive.dlb>                         list contents
@@ -54,7 +55,7 @@ fn main() {
         "c" => {
             let mut level = 7u32;
             let mut out: Option<PathBuf> = None;
-            let mut threads = auto_threads();
+            let mut threads: Option<usize> = None;
             let mut min_block = dlbcore::DEFAULT_MIN_BLOCK;
             let mut inputs = Vec::new();
             let mut i = 1;
@@ -63,14 +64,14 @@ fn main() {
                     "-l" => {
                         i += 1;
                         level = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("bad -l"));
-                        if !(1..=9).contains(&level) {
-                            fail("level must be 1..9");
+                        if !(1..=10).contains(&level) {
+                            fail("level must be 1..10");
                         }
                     }
                     "-t" => {
                         i += 1;
                         let n: usize = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("bad -t"));
-                        threads = if n == 0 { all_cores() } else { n };
+                        threads = Some(if n == 0 { all_cores() } else { n });
                     }
                     "-b" => {
                         i += 1;
@@ -100,7 +101,8 @@ fn main() {
             let t0 = Instant::now();
             let mut pg = progress("compress", payload.len());
             let mut opts = Options::new(level);
-            opts.threads = threads;
+            // ultra (10) is for maximum ratio: one stream unless -t is given
+            opts.threads = threads.unwrap_or(if level >= 10 { 1 } else { auto_threads() });
             opts.min_block = min_block;
             let blob = compress_payload(&payload, &boundaries, &opts, &mut pg).expect("not cancellable");
             std::fs::write(&out, &blob).unwrap_or_else(|e| fail(&format!("{}: {}", out.display(), e)));

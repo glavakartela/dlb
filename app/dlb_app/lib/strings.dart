@@ -26,6 +26,10 @@ class S {
   String get quality => t('Степень сжатия', 'Compression level');
   String get fast => t('Быстро', 'Fast');
   String get balanced => t('Баланс', 'Balanced');
+  String get ultra => t('Ультра', 'Ultra');
+  String get ultraWarn => t(
+      'Ультра: самое сильное сжатие, какое умеет программа. Один поток, примерно в 1,6 раза медленнее обычного максимума, около 550 МБ памяти.',
+      'Ultra: the strongest compression this program can do. Single thread, roughly 1.6x slower than Maximum, about 550 MB of memory.');
   String get maximum => t('Максимум', 'Maximum');
   String ramHint(int level, int mb) => t(
       'Уровень $level · около $mb МБ памяти',

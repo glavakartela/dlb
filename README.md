@@ -11,7 +11,7 @@ and decompressed on all CPU cores in parallel.
 ## Command line
 
 ```
-dlb c [-l 1-9] [-t N] [-o out.dlb] <file|dir>...   compress  (level 7 default: ~115 MB RAM per thread; 4: ~25 MB; 9: ~305 MB)
+dlb c [-l 1-10] [-t N] [-o out.dlb] <file|dir>...   compress  (level 7 default: ~115 MB RAM per thread; 4: ~25 MB; 9: ~305 MB)
 dlb x [-t N] <archive.dlb> [-C dir] [-f]           extract   (-f overwrites existing files)
 dlb t <archive.dlb>                         test integrity (CRC-32)
 dlb l <archive.dlb>                         list contents
@@ -41,6 +41,15 @@ A ratio of "tens of times" is only possible when the data is redundant (logs, re
 templated text, sparse data). Already-compressed formats (JPEG, MP4, ZIP, archives) and
 encrypted or random data cannot be compressed at all; that is a theorem, not a limitation of
 this program. Typical text and source code compress x4 to x9, executables x3 to x5.
+
+### Level 10: Ultra
+
+`dlb c -l 10` uses an extended model: 18 contexts instead of 12 (orders 10, 12, 16 and 24, a
+record-stride context, a word + order-2 context), a fourth mixer selector, and a table twice as
+large (about 550 MB). It is the strongest the program can do and is meant for a single stream
+(the CLI defaults to `-t 1` at this level; the app uses one thread). Measured on 1 MB samples,
+versus level 7: source code -2%, executables -2.7%, text logs -14%, at about 1.6x the time.
+Gains are small on already tight data and large on structured, repetitive text.
 
 ### Parallel mode: speed vs. ratio
 

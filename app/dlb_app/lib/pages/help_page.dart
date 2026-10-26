@@ -61,7 +61,7 @@ class HelpPage extends StatelessWidget {
                 children: [
                   Text(s.quality, style: t.textTheme.titleMedium),
                   const SizedBox(height: 12),
-                  for (final l in const [4, 7, 9])
+                  for (final l in const [4, 7, 9, 10])
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 4),
                       child: Row(
@@ -71,7 +71,9 @@ class HelpPage extends StatelessWidget {
                                   ? s.fast
                                   : l == 7
                                       ? s.balanced
-                                      : s.maximum)),
+                                      : l == 9
+                                          ? s.maximum
+                                          : s.ultra)),
                           Text(s.ramHint(l, levelRamMb(l)),
                               style: t.textTheme.bodySmall?.copyWith(
                                   color: t.colorScheme.onSurfaceVariant)),

@@ -11,8 +11,8 @@ flutter pub get
 for f in android/app/build.gradle.kts android/app/build.gradle; do
   [ -f "$f" ] || continue
   sed -i -E \
-    -e 's/compileSdk(Version)? *(=)? *[^\r\n]*/compileSdk = 36/' \
-    -e 's/targetSdk(Version)? *(=)? *[^\r\n]*/targetSdk = 36/' \
+    -e 's/compileSdk(Version)? *(=)? *[^\r\n]*/compileSdk = 35/' \
+    -e 's/targetSdk(Version)? *(=)? *[^\r\n]*/targetSdk = 35/' \
     -e 's/minSdk(Version)? *(=)? *[^\r\n]*/minSdk = 24/' "$f"
   # Groovy file uses space syntax without '='
   case "$f" in *.gradle) sed -i -E 's/^( *)(compileSdk|targetSdk|minSdk) = /\1\2 /' "$f";; esac

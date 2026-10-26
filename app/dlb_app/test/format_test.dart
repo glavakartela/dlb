@@ -18,6 +18,7 @@ void main() {
     expect(levelRamMb(4), 8 + 4 + 12);
     expect(levelRamMb(7), 64 + 32 + 12);
     expect(levelRamMb(9), 256 + 32 + 12);
+    expect(levelRamMb(10), 512 + 32 + 12);
   });
   test('uniqueName', () {
     final taken = {'a.dlb', 'a (1).dlb'};

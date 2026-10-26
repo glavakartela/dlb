@@ -42,7 +42,8 @@ const MAX_BLOCKS: usize = 1 << 16;
 
 /// Map level 1..=9 to log2(table slots): 18 (1 MB) .. 26 (256 MB).
 pub fn level_to_nbits(level: u32, data_len: usize) -> u32 {
-    let want = 17 + level.clamp(1, 9);
+    // level 10 (ultra) uses a table twice as large as level 9
+    let want = 17 + level.clamp(1, 9) + (level >= 10) as u32;
     // no point in a table much bigger than the input needs
     let need = (usize::BITS - data_len.max(1).leading_zeros()) + 6;
     want.min(need.max(16))
@@ -50,7 +51,7 @@ pub fn level_to_nbits(level: u32, data_len: usize) -> u32 {
 
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// 1..=9; higher uses more memory per thread (see `level_to_nbits`).
+    /// 1..=10 (10 = ultra model: more contexts, slowest, strongest); higher uses more memory per thread (see `level_to_nbits`).
     pub level: u32,
     /// Worker threads. Each one needs its own model memory.
     pub threads: usize,
@@ -208,11 +209,12 @@ pub fn compress_payload(
         let (a, b) = ranges[i];
         let data = &payload[a..b];
         let nbits = level_to_nbits(level, data.len());
-        let body = cm::cm_compress(data, nbits, prog)?;
+        let nb = (nbits | if level >= 10 { cm::ULTRA_FLAG } else { 0 }) as u8;
+        let body = cm::cm_compress(data, nb as u32, prog)?;
         Some(if body.len() >= data.len() {
-            BlockOut { stored: true, nbits: nbits as u8, body: Vec::new() }
+            BlockOut { stored: true, nbits: nb, body: Vec::new() }
         } else {
-            BlockOut { stored: false, nbits: nbits as u8, body }
+            BlockOut { stored: false, nbits: nb, body }
         })
     };
     let blocks = run_blocks(&sizes, opts.threads, &work, progress)?;
@@ -258,7 +260,7 @@ fn parse_blocks(blob: &[u8]) -> Result<(usize, u32, Vec<BlockInfo<'_>>), String>
         return Err("not a DLB file (bad magic)".into());
     }
     let corrupt = |m: &str| Err(format!("corrupt header: {}", m));
-    let check_nbits = |n: u32| (10..=30).contains(&n);
+    let check_nbits = |n: u32| (10..=30).contains(&(n & 0x7F));
 
     if &blob[0..4] == MAGIC_V1 {
         if blob.len() < V1_HEADER {
@@ -401,6 +403,16 @@ mod tests {
         rt(b"", 1, DEFAULT_MIN_BLOCK);
         rt(b"a", 4, DEFAULT_MIN_BLOCK);
         rt(b"hello hello hello hello hello world", 1, DEFAULT_MIN_BLOCK);
+    }
+
+    #[test]
+    fn roundtrip_ultra_level() {
+        let mut data = Vec::new();
+        for i in 0..3000u32 {
+            data.extend_from_slice(format!("line {} value={} status=ok\n", i, i * 7 % 101).as_bytes());
+        }
+        rt(&data, 10, DEFAULT_MIN_BLOCK);
+        rt(&data, 10, 20_000); // several ultra blocks
     }
 
     #[test]

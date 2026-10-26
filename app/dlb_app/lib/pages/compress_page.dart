@@ -80,7 +80,7 @@ class _CompressPageState extends State<CompressPage> {
     final cache = isAndroid ? (await getTemporaryDirectory()).path : null;
     final out = _customOut ?? _autoOut(cache);
     _runner.startCompress(List.of(_items), out, _level,
-        threads: _multi ? 0 : 1);
+        threads: (_multi && _level < 10) ? 0 : 1);
   }
 
   Future<void> _saveCopy() async {
@@ -271,6 +271,7 @@ class _CompressPageState extends State<CompressPage> {
                   ButtonSegment(value: 4, label: Text(s.fast)),
                   ButtonSegment(value: 7, label: Text(s.balanced)),
                   ButtonSegment(value: 9, label: Text(s.maximum)),
+                  ButtonSegment(value: 10, label: Text(s.ultra)),
                 ],
                 selected: {_level},
                 onSelectionChanged:
@@ -286,8 +287,15 @@ class _CompressPageState extends State<CompressPage> {
               title: Text(s.multiCore),
               subtitle: Text(s.multiCoreHint),
               value: _multi,
-              onChanged: busy ? null : (v) => setState(() => _multi = v),
+              onChanged:
+                  (busy || _level >= 10) ? null : (v) => setState(() => _multi = v),
             ),
+            if (_level >= 10) ...[
+              const SizedBox(height: 8),
+              Text(s.ultraWarn,
+                  style: t.textTheme.bodyMedium
+                      ?.copyWith(color: t.colorScheme.tertiary)),
+            ],
             const SizedBox(height: 4),
             Text(s.slowNote,
                 style: t.textTheme.bodySmall
