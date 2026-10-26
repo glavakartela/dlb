@@ -94,7 +94,14 @@ class DlbNative {
       return DynamicLibrary.open('libdlbcore.so');
     }
     if (Platform.isWindows) return DynamicLibrary.open('dlbcore.dll');
-    if (Platform.isMacOS) return DynamicLibrary.open('libdlbcore.dylib');
+    if (Platform.isMacOS) {
+      // bundled at DLB.app/Contents/Frameworks (see scripts/build_native.sh)
+      final exe = File(Platform.resolvedExecutable);
+      final inBundle =
+          '${exe.parent.parent.path}/Frameworks/libdlbcore.dylib';
+      return DynamicLibrary.open(
+          File(inBundle).existsSync() ? inBundle : 'libdlbcore.dylib');
+    }
     throw UnsupportedError('DLB: unsupported platform');
   }
 

@@ -7,6 +7,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
 jobs:
   cli:
     name: CLI ${{ matrix.target }}
@@ -28,6 +35,15 @@ jobs:
         with:
           name: dlb-cli-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/dlb.exe
+      - name: Prepare release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/dlb.exe dlb-${{ matrix.target }}.exe
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dlb-${{ matrix.target }}.exe
 
   app:
     name: Flutter app (x64)
@@ -55,3 +71,12 @@ jobs:
         with:
           name: dlb-app-windows-x64
           path: app/dlb_app/build/windows/x64/runner/Release
+      - name: Prepare release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          (cd app/dlb_app/build/windows/x64/runner/Release && 7z a -tzip "$GITHUB_WORKSPACE/dlb-app-windows-x64.zip" .)
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dlb-app-windows-x64.zip

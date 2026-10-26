@@ -2,7 +2,7 @@
 # One-time: generate the platform runner folders (android/, linux/, windows/) around lib/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-flutter create --platforms=android,linux,windows --project-name dlb_app --org dev.dlb .
+flutter create --platforms=android,linux,windows,macos --project-name dlb_app --org dev.dlb .
 rm -f test/widget_test.dart   # template counter test does not apply to this app
 flutter pub get
 
@@ -41,3 +41,10 @@ subprojects {
 }
 GRV
 fi
+
+# macOS: the sandboxed app needs access to files the user picks, and writes next to them.
+for f in macos/Runner/DebugProfile.entitlements macos/Runner/Release.entitlements; do
+  [ -f "$f" ] || continue
+  /usr/libexec/PlistBuddy -c "Add :com.apple.security.files.user-selected.read-write bool true" "$f" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :com.apple.security.files.downloads.read-write bool true" "$f" 2>/dev/null || true
+done

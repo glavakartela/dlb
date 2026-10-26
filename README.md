@@ -89,9 +89,10 @@ the UI polls progress, and cancelling is safe.
 
 ```
 cd app/dlb_app
-scripts/setup.sh                       # once: generates android/, linux/, windows/ runner folders
+scripts/setup.sh                       # once: generates android/, linux/, windows/, macos/ runner folders
 flutter build linux --release   && scripts/build_native.sh linux
 flutter build windows --release && scripts/build_native.sh windows
+flutter build macos --release   && scripts/build_native.sh macos
 scripts/build_native.sh android && flutter build apk --release --split-per-abi
 ```
 
@@ -108,13 +109,21 @@ cargo test --release
 
 ## CI
 
-Three independent GitHub Actions workflows in `.github/workflows/`:
+Four independent GitHub Actions workflows in `.github/workflows/`:
 
 | workflow | jobs | artifacts |
 |---|---|---|
 | `linux.yml` | static musl CLI for x86_64, i686, aarch64, armv7; Flutter app (x64) | `dlb-cli-*`, `dlb-app-linux-x64` |
 | `windows.yml` | CLI for x64, x86, arm64 (MSVC); Flutter app (x64) | `dlb-cli-*`, `dlb-app-windows-x64` |
+| `macos.yml` | universal (arm64 + x86_64) CLI; universal Flutter app, ad-hoc signed | `dlb-cli-macos-universal`, `dlb-app-macos` |
 | `android.yml` | APKs for arm64-v8a, armeabi-v7a, x86, x86_64 | `dlb-app-android` |
+
+Pushing a tag `v*` also attaches all binaries to a GitHub Release. Runs of the same branch cancel
+each other.
+
+**macOS note:** the app is ad-hoc signed, not notarized (that needs a paid Apple developer
+account). On first launch use right click, Open, or run `xattr -dr com.apple.quarantine DLB.app`.
+The CLI needs the same (`xattr -d com.apple.quarantine dlb`) if downloaded with a browser.
 
 The static Linux CLI binaries also run on Android through `adb shell` or Termux. The whole
 algorithm is integer-only, so an archive made on one architecture decompresses bit-identically

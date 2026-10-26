@@ -7,6 +7,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
 jobs:
   # Static musl CLI builds. These also run on Android via `adb shell` or Termux.
   cli:
@@ -32,6 +39,15 @@ jobs:
         with:
           name: dlb-cli-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/dlb
+      - name: Prepare release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/dlb dlb-${{ matrix.target }}
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dlb-${{ matrix.target }}
 
   app:
     name: Flutter app (x64)
@@ -57,3 +73,12 @@ jobs:
         with:
           name: dlb-app-linux-x64
           path: app/dlb_app/build/linux/x64/release/bundle
+      - name: Prepare release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tar -czf dlb-app-linux-x64.tar.gz -C app/dlb_app/build/linux/x64/release/bundle .
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dlb-app-linux-x64.tar.gz

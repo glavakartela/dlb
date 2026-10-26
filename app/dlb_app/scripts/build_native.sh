@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the Rust core as a shared library and put it where Flutter bundles it.
-# Usage: scripts/build_native.sh android|linux|windows
+# Usage: scripts/build_native.sh android|linux|windows|macos
 set -euo pipefail
 APP="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$APP/../.." && pwd)"
@@ -15,5 +15,19 @@ case "${1:-}" in
   windows)   # run after `flutter build windows --release` (Git Bash / MSYS)
     cargo build --release
     cp target/release/dlbcore.dll "$APP/build/windows/x64/runner/Release/dlbcore.dll" ;;
-  *) echo "usage: $0 android|linux|windows"; exit 2 ;;
+  macos)     # run after `flutter build macos --release`; universal (arm64 + x86_64) dylib
+    rustup target add aarch64-apple-darwin x86_64-apple-darwin
+    cargo build --release --target aarch64-apple-darwin --lib
+    cargo build --release --target x86_64-apple-darwin --lib
+    APPDIR="$(ls -d "$APP"/build/macos/Build/Products/Release/*.app | head -n1)"
+    mkdir -p "$APPDIR/Contents/Frameworks"
+    lipo -create -output "$APPDIR/Contents/Frameworks/libdlbcore.dylib" \
+      target/aarch64-apple-darwin/release/libdlbcore.dylib \
+      target/x86_64-apple-darwin/release/libdlbcore.dylib
+    install_name_tool -id "@rpath/libdlbcore.dylib" "$APPDIR/Contents/Frameworks/libdlbcore.dylib"
+    # ad-hoc sign so the app launches on Apple Silicon (not notarized; see README)
+    codesign --force --sign - "$APPDIR/Contents/Frameworks/libdlbcore.dylib"
+    codesign --force --deep --sign - "$APPDIR"
+    echo "$APPDIR" ;;
+  *) echo "usage: $0 android|linux|windows|macos"; exit 2 ;;
 esac
