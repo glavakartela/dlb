@@ -131,7 +131,7 @@ fn main() {
                 n.push(".dlb");
                 PathBuf::from(n)
             });
-            let (payload, boundaries) = archive::build_payload(&inputs).unwrap_or_else(|e| fail(&e.to_string()));
+            let (payload, boundaries, store_from) = archive::build_payload(&inputs).unwrap_or_else(|e| fail(&e.to_string()));
             if payload.len() > dlbcore::MAX_PAYLOAD {
                 fail("input is larger than the supported maximum");
             }
@@ -141,6 +141,7 @@ fn main() {
             // ultra (10) is for maximum ratio: one stream unless -t is given
             opts.threads = threads.unwrap_or(if level >= 10 { 1 } else { auto_threads() });
             opts.min_block = min_block;
+            opts.store_from = store_from;
             let blob = compress_payload(&payload, &boundaries, &opts, &mut pg).expect("not cancellable");
             let blob = match password_from(pw_arg, &keyfile) {
                 Some(pw) => crypto::seal(&blob, &pw).unwrap_or_else(|e| fail(&e)),

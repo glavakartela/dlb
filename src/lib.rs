@@ -41,6 +41,8 @@ const V2_ENTRY: usize = 10;
 pub const MAX_BLOCK: usize = 0xFFFF_0000;
 pub const MAX_PAYLOAD: usize = if usize::BITS >= 64 { 1 << 40 } else { MAX_BLOCK };
 pub const DEFAULT_MIN_BLOCK: usize = 32 << 20;
+/// Size of the blocks used for the stored (incompressible) region.
+const STORE_CHUNK: usize = 256 << 20;
 const MAX_BLOCKS: usize = 1 << 16;
 
 /// Map level 1..=9 to log2(table slots): 18 (1 MB) .. 26 (256 MB).
@@ -60,11 +62,15 @@ pub struct Options {
     pub threads: usize,
     /// Smallest block size when splitting for threads.
     pub min_block: usize,
+    /// Payload offset from which data is known to be incompressible (already compressed
+    /// media/archives): it is stored in its own blocks without running the model, which is
+    /// much faster and costs nothing in size. `usize::MAX` = no such region.
+    pub store_from: usize,
 }
 
 impl Options {
     pub fn new(level: u32) -> Self {
-        Options { level, threads: 1, min_block: DEFAULT_MIN_BLOCK }
+        Options { level, threads: 1, min_block: DEFAULT_MIN_BLOCK, store_from: usize::MAX }
     }
 }
 
@@ -199,11 +205,22 @@ pub fn compress_payload(
     opts: &Options,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Option<Vec<u8>> {
-    let ends = plan_blocks(payload.len(), boundaries, opts.threads, opts.min_block);
-    let mut ranges = Vec::with_capacity(ends.len());
-    let mut s = 0usize;
-    for &e in &ends {
+    let sf = opts.store_from.min(payload.len());
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut stored_only: Vec<bool> = Vec::new();
+    if sf > 0 || payload.is_empty() {
+        let mut s = 0usize;
+        for e in plan_blocks(sf, boundaries, opts.threads, opts.min_block) {
+            ranges.push((s, e));
+            stored_only.push(false);
+            s = e;
+        }
+    }
+    let mut s = sf;
+    while s < payload.len() {
+        let e = (s + STORE_CHUNK).min(payload.len());
         ranges.push((s, e));
+        stored_only.push(true);
         s = e;
     }
     let sizes: Vec<usize> = ranges.iter().map(|&(a, b)| b - a).collect();
@@ -211,6 +228,12 @@ pub fn compress_payload(
 
     let work = |i: usize, prog: &mut dyn FnMut(usize) -> bool| -> Option<BlockOut> {
         let (a, b) = ranges[i];
+        if stored_only[i] {
+            if !prog(b - a) {
+                return None;
+            }
+            return Some(BlockOut { stored: true, nbits: 0, body: Vec::new() });
+        }
         let data = &payload[a..b];
         let nbits = level_to_nbits(level, data.len());
         let nb = (nbits | if level >= 10 { cm::ULTRA_FLAG } else { 0 }) as u8;
@@ -392,7 +415,7 @@ mod tests {
     }
 
     fn rt(data: &[u8], threads: usize, min_block: usize) -> (usize, usize) {
-        let opts = Options { level: 3, threads, min_block };
+        let opts = Options { level: 3, threads, min_block, store_from: usize::MAX };
         let c = compress_payload(data, &[], &opts, &mut |_| true).unwrap();
         let blocks = u32::from_le_bytes(c[18..22].try_into().unwrap()) as usize;
         for dt in [1, 3] {
@@ -421,7 +444,7 @@ mod tests {
             x as usize % m
         };
         let data: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8 ^ (i / 97) as u8).collect();
-        let opts = Options { level: 3, threads: 2, min_block: 8_000 };
+        let opts = Options { level: 3, threads: 2, min_block: 8_000, store_from: usize::MAX };
         let blob = compress_payload(&data, &[], &opts, &mut |_| true).unwrap();
         for round in 0..300 {
             let mut b = blob.clone();
@@ -442,6 +465,31 @@ mod tests {
             let _ = decompress_payload(&b, 2, &mut |_| true);
             let _ = archive::parse_payload(&b);
             let _ = crypto::open(&b, "pw");
+        }
+    }
+
+    #[test]
+    fn incompressible_tail_is_stored_without_modelling() {
+        let mut x = 99u32;
+        let mut payload: Vec<u8> = (0..40_000u32).map(|i| (i % 13) as u8).collect();
+        let sf = payload.len();
+        payload.extend((0..60_000).map(|_| {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            (x >> 24) as u8
+        }));
+        for threads in [1usize, 3] {
+            let opts = Options { level: 3, threads, min_block: 10_000, store_from: sf };
+            let blob = compress_payload(&payload, &[], &opts, &mut |_| true).unwrap();
+            let (_, _, blocks) = parse_blocks(&blob).unwrap();
+            assert!(blocks.last().unwrap().stored);
+            assert!(!blocks[0].stored);
+            assert_eq!(decompress_payload(&blob, threads, &mut |_| true).unwrap(), payload);
+            // store_from beyond the end / at 0 behave
+            for sf in [0usize, payload.len(), usize::MAX] {
+                let o = Options { store_from: sf, ..opts.clone() };
+                let b = compress_payload(&payload, &[], &o, &mut |_| true).unwrap();
+                assert_eq!(decompress_payload(&b, 2, &mut |_| true).unwrap(), payload);
+            }
         }
     }
 
@@ -547,7 +595,7 @@ mod tests {
     fn cancel_stops_work() {
         let data = text(600_000);
         for threads in [1, 3] {
-            let opts = Options { level: 3, threads, min_block: 50_000 };
+            let opts = Options { level: 3, threads, min_block: 50_000, store_from: usize::MAX };
             let mut calls = 0;
             let r = compress_payload(&data, &[], &opts, &mut |_| {
                 calls += 1;

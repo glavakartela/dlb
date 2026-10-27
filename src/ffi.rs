@@ -115,7 +115,7 @@ pub unsafe extern "C" fn dlb_compress_start(
     };
     let job = Job::new();
     spawn(&job, move |job| {
-        let (payload, boundaries) = match archive::build_payload(&inputs) {
+        let (payload, boundaries, store_from) = match archive::build_payload(&inputs) {
             Ok(p) => p,
             Err(e) => return job.fail(e.to_string()),
         };
@@ -133,6 +133,7 @@ pub unsafe extern "C" fn dlb_compress_start(
         );
         job.phase.store(PHASE_CODING, SeqCst);
         let mut opts = Options::new(level);
+        opts.store_from = store_from;
         opts.threads = if threads == 0 { auto_threads() } else { threads as usize };
         let blob = compress_payload(&payload, &boundaries, &opts, &mut |d| {
             job.done.store(d as u64, SeqCst);

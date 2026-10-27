@@ -76,6 +76,14 @@ operands become absolute addresses) before modelling, which makes repeated call 
 bytes. Measured at level 5 on 3 MB of real binaries: `python3` -8.8%, `git` -9.4%, `libc.so` -3.7%
 smaller output. Other files are untouched.
 
+### Already-compressed files are not modelled
+
+JPEG, PNG, MP3, MP4, MKV, ZIP, 7z, gz, docx and similar data is already entropy coded, so running
+the model over it only burns time. Such files (found by extension and by magic number, 4 KiB and
+up) are placed at the end of the archive and stored in their own blocks without compression. On
+a mix of 20 MB of JPEG-like data and 5.6 MB of logs (level 5) this took 9.4 s instead of 62.5 s,
+with a slightly smaller result. The archive is still one normal `.dlb` file.
+
 ### Password protection
 
 `-k FILE` uses a key file (its SHA-256 is mixed into the password; alone or together with `-p`; lose the file and the data is gone).

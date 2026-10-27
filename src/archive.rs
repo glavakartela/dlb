@@ -36,6 +36,54 @@ struct Src {
     name: String,
     path: PathBuf,
     kind: u32,
+    /// already compressed media / archive: goes to the stored tail of the payload
+    inc: bool,
+}
+
+/// Formats whose data is already entropy coded; modelling them again only costs time.
+const INCOMPRESSIBLE_EXT: &[&str] = &[
+    "zip", "7z", "rar", "gz", "tgz", "bz2", "xz", "zst", "lz4", "br", "jar", "apk", "aab", "docx",
+    "xlsx", "pptx", "odt", "ods", "odp", "epub", "jpg", "jpeg", "png", "webp", "heic", "heif",
+    "avif", "mp3", "aac", "m4a", "opus", "ogg", "oga", "ogv", "flac", "mp4", "m4v", "mov", "mkv",
+    "webm", "avi", "woff2",
+];
+
+/// Magic-number check for already-compressed data (needs the first 16 bytes).
+pub fn looks_incompressible(h: &[u8]) -> bool {
+    let starts = |p: &[u8]| h.len() >= p.len() && &h[..p.len()] == p;
+    starts(b"PK\x03\x04")
+        || starts(b"\xFF\xD8\xFF")
+        || starts(b"\x89PNG\r\n\x1a\n")
+        || starts(b"GIF8")
+        || (starts(b"RIFF") && h.len() >= 12 && &h[8..12] == b"WEBP")
+        || starts(b"\x1f\x8b")
+        || starts(b"BZh")
+        || starts(b"\xFD7zXZ\x00")
+        || starts(b"\x28\xB5\x2F\xFD")
+        || starts(b"7z\xBC\xAF\x27\x1C")
+        || starts(b"Rar!")
+        || starts(b"ID3")
+        || starts(b"OggS")
+        || starts(b"fLaC")
+        || starts(b"\x1A\x45\xDF\xA3")
+        || starts(b"wOF2")
+        || (h.len() >= 8 && &h[4..8] == b"ftyp")
+}
+
+fn is_incompressible_file(path: &Path, name: &str) -> bool {
+    use std::io::Read;
+    let Ok(md) = fs::metadata(path) else { return false };
+    if md.len() < 4096 {
+        return false;
+    }
+    if INCOMPRESSIBLE_EXT.contains(&ext_key(name).as_str()) {
+        return true;
+    }
+    let mut h = [0u8; 16];
+    match fs::File::open(path).and_then(|mut f| f.read_exact(&mut h)) {
+        Ok(()) => looks_incompressible(&h),
+        Err(_) => false,
+    }
 }
 
 // ------------------------------------------------------------ x86 branch filter
@@ -102,19 +150,20 @@ pub fn x86_decode(data: &mut [u8]) {
 fn walk(base: &str, path: &Path, out: &mut Vec<Src>) -> io::Result<()> {
     let md = fs::symlink_metadata(path)?;
     if md.file_type().is_symlink() {
-        out.push(Src { name: base.to_string(), path: path.to_path_buf(), kind: KIND_SYMLINK });
+        out.push(Src { name: base.to_string(), path: path.to_path_buf(), kind: KIND_SYMLINK, inc: false });
     } else if md.is_dir() {
         let mut kids: Vec<_> = fs::read_dir(path)?.collect::<Result<_, _>>()?;
         kids.sort_by_key(|e| e.file_name());
         if kids.is_empty() {
-            out.push(Src { name: base.to_string(), path: path.to_path_buf(), kind: KIND_DIR });
+            out.push(Src { name: base.to_string(), path: path.to_path_buf(), kind: KIND_DIR, inc: false });
         }
         for k in kids {
             let n = format!("{}/{}", base, k.file_name().to_string_lossy());
             walk(&n, &k.path(), out)?;
         }
     } else if md.is_file() {
-        out.push(Src { name: base.to_string(), path: path.to_path_buf(), kind: KIND_FILE });
+        let inc = is_incompressible_file(path, base);
+        out.push(Src { name: base.to_string(), path: path.to_path_buf(), kind: KIND_FILE, inc });
     }
     // special files (sockets, devices) are skipped
     Ok(())
@@ -139,9 +188,10 @@ fn ext_key(name: &str) -> String {
 
 /// Read all inputs and build the solid payload. Files are grouped by extension
 /// so similar data sits together (better ratio).
-/// Returns the payload and the end offset of every file's data inside it
-/// (the first entry is the end of the header), used to cut parallel blocks.
-pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>)> {
+/// Already-compressed files (JPEG, MP4, ZIP, ...) are placed last. Returns the payload, the
+/// end offset of every entry's data (the first value is the end of the header; used to cut
+/// parallel blocks) and the offset where the incompressible tail starts (`usize::MAX` if none).
+pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>, usize)> {
     let mut srcs = Vec::new();
     for p in paths {
         let base = p
@@ -150,7 +200,8 @@ pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>)> {
             .unwrap_or_else(|| "file".to_string());
         walk(&base, p, &mut srcs)?;
     }
-    srcs.sort_by(|a, b| (ext_key(&a.name), &a.name).cmp(&(ext_key(&b.name), &b.name)));
+    srcs.sort_by(|a, b| (a.inc, ext_key(&a.name), &a.name).cmp(&(b.inc, ext_key(&b.name), &b.name)));
+    let n_plain = srcs.iter().filter(|s| !s.inc).count();
 
     // The header size is known from the names alone, so file data is appended straight into
     // the final buffer (no second copy of the whole payload).
@@ -201,7 +252,8 @@ pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>)> {
     }
     debug_assert_eq!(head.len(), head_len);
     buf[..head_len].copy_from_slice(&head);
-    Ok((buf, boundaries))
+    let store_from = if n_plain < srcs.len() { boundaries[n_plain] } else { usize::MAX };
+    Ok((buf, boundaries, store_from))
 }
 
 pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {
@@ -427,7 +479,7 @@ mod tests {
             std::os::unix::fs::symlink("sub/a.txt", src.join("link")).unwrap();
             std::os::unix::fs::symlink("../outside", src.join("sub/up")).unwrap();
         }
-        let (payload, _b) = build_payload(&[src.clone()]).unwrap();
+        let (payload, _b, _sf) = build_payload(&[src.clone()]).unwrap();
         let entries = parse_payload(&payload).unwrap();
         let kinds: Vec<(String, u32, bool)> =
             entries.iter().map(|(e, _)| (e.name.clone(), e.kind(), e.x86_filtered())).collect();
@@ -445,6 +497,29 @@ mod tests {
             assert_eq!(fs::read_link(out.join("proj/link")).unwrap().to_str().unwrap(), "sub/a.txt");
             assert_eq!(fs::read_to_string(out.join("proj/link")).unwrap(), "hello hello hello");
         }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn compressed_files_go_to_the_stored_tail() {
+        let d = tmp("inc");
+        let src = d.join("m");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a.txt"), vec![b'a'; 5000]).unwrap();
+        let mut jpg = b"\xFF\xD8\xFF\xE0".to_vec();
+        jpg.extend((0..6000u32).map(|i| (i * 7919 % 251) as u8));
+        fs::write(src.join("b.jpg"), &jpg).unwrap(); // by extension
+        fs::write(src.join("noext"), &jpg).unwrap(); // by magic only
+        fs::write(src.join("z.txt"), vec![b'z'; 5000]).unwrap();
+        let (payload, boundaries, sf) = build_payload(&[src.clone()]).unwrap();
+        let entries = parse_payload(&payload).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(e, _)| e.name.as_str()).collect();
+        assert_eq!(names, ["m/a.txt", "m/z.txt", "m/noext", "m/b.jpg"]);
+        assert_eq!(sf, boundaries[2]);
+        assert_eq!(payload.len() - sf, 2 * jpg.len());
+        // no compressed files: no tail
+        let (_p, _b, sf2) = build_payload(&[src.join("a.txt")]).unwrap();
+        assert_eq!(sf2, usize::MAX);
         let _ = fs::remove_dir_all(&d);
     }
 
