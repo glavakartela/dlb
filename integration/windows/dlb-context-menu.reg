@@ -1,0 +1,30 @@
+Windows Registry Editor Version 5.00
+
+; Right-click menu for DLB (current user only, no admin rights needed).
+; 1. Put dlb.exe in C:\Tools\DLB\  (or edit every path below; backslashes are doubled).
+; 2. Double-click this file. To undo, delete the keys under HKEY_CURRENT_USER\Software\Classes
+;    named DLB.Compress / DLB.Extract and the "DLB.Archive" association.
+
+[HKEY_CURRENT_USER\Software\Classes\*\shell\DLB.Compress]
+@="Compress with DLB"
+
+[HKEY_CURRENT_USER\Software\Classes\*\shell\DLB.Compress\command]
+@="cmd /c \"pushd \"%W\" && \"C:\\Tools\\DLB\\dlb.exe\" c \"%1\" & pause\""
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\DLB.Compress]
+@="Compress with DLB"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\DLB.Compress\command]
+@="cmd /c \"pushd \"%W\" && \"C:\\Tools\\DLB\\dlb.exe\" c \"%1\" & pause\""
+
+[HKEY_CURRENT_USER\Software\Classes\.dlb]
+@="DLB.Archive"
+
+[HKEY_CURRENT_USER\Software\Classes\DLB.Archive]
+@="DLB archive"
+
+[HKEY_CURRENT_USER\Software\Classes\DLB.Archive\shell\DLB.Extract]
+@="Extract here"
+
+[HKEY_CURRENT_USER\Software\Classes\DLB.Archive\shell\DLB.Extract\command]
+@="cmd /c \"pushd \"%W\" && \"C:\\Tools\\DLB\\dlb.exe\" x \"%1\" & pause\""

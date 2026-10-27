@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DLB
+Comment=Maximum-ratio file compressor
+Exec=dlb_app %f
+Icon=package-x-generic
+Terminal=false
+Categories=Utility;Archiving;
+MimeType=application/x-dlb;

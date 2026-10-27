@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../format.dart';
 import '../job_runner.dart';
+import '../launch.dart';
 import '../native/dlb_native.dart';
 import '../platform.dart';
 import '../strings.dart';
@@ -32,6 +33,16 @@ class _ExtractPageState extends State<ExtractPage> {
   bool get _needPw => _encrypted && _pw.text.isEmpty;
 
   @override
+  void initState() {
+    super.initState();
+    final p = launchArchive.value;
+    if (p != null) {
+      launchArchive.value = null;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _setArchive(p));
+    }
+  }
+
+  @override
   void dispose() {
     _runner.dispose();
     _pw.dispose();
@@ -46,6 +57,10 @@ class _ExtractPageState extends State<ExtractPage> {
     );
     final path = r?.files.single.path;
     if (path == null) return;
+    await _setArchive(path);
+  }
+
+  Future<void> _setArchive(String path) async {
     final base = isAndroid
         ? (await getApplicationDocumentsDirectory()).path
         : p.dirname(path);

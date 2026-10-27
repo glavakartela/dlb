@@ -23,6 +23,7 @@
 
 pub mod archive;
 pub mod crypto;
+pub mod glob;
 pub mod cm;
 pub mod crc32;
 pub mod ffi;
@@ -195,6 +196,48 @@ struct BlockOut {
     stored: bool,
     nbits: u8,
     body: Vec<u8>, // empty when stored (the raw bytes are copied from the payload)
+}
+
+/// One block of a `.dlb` file as seen by [`inspect`].
+#[derive(Clone, Debug)]
+pub struct BlockSummary {
+    pub raw: usize,
+    pub comp: usize,
+    pub stored: bool,
+    /// log2 of the context table slots (0 for stored blocks)
+    pub nbits: u32,
+    /// built with the ultra model (level 10)
+    pub ultra: bool,
+}
+
+/// Container information, read from the headers only (nothing is decompressed).
+#[derive(Clone, Debug)]
+pub struct Info {
+    /// 1 for `DLB1`, 2 for `DLB2`
+    pub version: u8,
+    pub payload_len: usize,
+    pub crc: u32,
+    pub blocks: Vec<BlockSummary>,
+}
+
+/// Parses the container headers of a plain (not encrypted) `.dlb` blob.
+pub fn inspect(blob: &[u8]) -> Result<Info, String> {
+    let (len, crc, blocks) = parse_blocks(blob)?;
+    Ok(Info {
+        version: if &blob[0..4] == MAGIC_V1 { 1 } else { 2 },
+        payload_len: len,
+        crc,
+        blocks: blocks
+            .iter()
+            .map(|b| BlockSummary {
+                raw: b.raw,
+                comp: if b.stored { b.raw } else { b.body.len() },
+                stored: b.stored,
+                nbits: if b.stored { 0 } else { b.nbits & 0x7F },
+                ultra: !b.stored && b.nbits & cm::ULTRA_FLAG != 0,
+            })
+            .collect(),
+    })
 }
 
 /// Compresses `payload`. `boundaries` are file end offsets inside it (may be empty).

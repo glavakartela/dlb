@@ -18,6 +18,8 @@ pub struct Entry {
     pub name: String,
     pub size: u64,
     pub mode: u32,
+    /// modification time, seconds since the Unix epoch (0 = unknown)
+    pub mtime: i64,
 }
 
 impl Entry {
@@ -147,7 +149,7 @@ pub fn x86_decode(data: &mut [u8]) {
     x86_filter(data, false)
 }
 
-fn walk(base: &str, path: &Path, out: &mut Vec<Src>) -> io::Result<()> {
+fn walk(base: &str, path: &Path, out: &mut Vec<Src>, exclude: &[String]) -> io::Result<()> {
     let md = fs::symlink_metadata(path)?;
     if md.file_type().is_symlink() {
         out.push(Src { name: base.to_string(), path: path.to_path_buf(), kind: KIND_SYMLINK, inc: false });
@@ -159,7 +161,10 @@ fn walk(base: &str, path: &Path, out: &mut Vec<Src>) -> io::Result<()> {
         }
         for k in kids {
             let n = format!("{}/{}", base, k.file_name().to_string_lossy());
-            walk(&n, &k.path(), out)?;
+            if crate::glob::any_matches(exclude, &n) {
+                continue;
+            }
+            walk(&n, &k.path(), out, exclude)?;
         }
     } else if md.is_file() {
         let inc = is_incompressible_file(path, base);
@@ -192,13 +197,30 @@ fn ext_key(name: &str) -> String {
 /// end offset of every entry's data (the first value is the end of the header; used to cut
 /// parallel blocks) and the offset where the incompressible tail starts (`usize::MAX` if none).
 pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>, usize)> {
+    build_payload_ex(paths, &[])
+}
+
+fn mtime_of(md: &fs::Metadata) -> i64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Like [`build_payload`], skipping everything below the inputs that matches an `exclude`
+/// pattern (see `glob::pattern_matches`).
+pub fn build_payload_ex(
+    paths: &[PathBuf],
+    exclude: &[String],
+) -> io::Result<(Vec<u8>, Vec<usize>, usize)> {
     let mut srcs = Vec::new();
     for p in paths {
         let base = p
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
-        walk(&base, p, &mut srcs)?;
+        walk(&base, p, &mut srcs, exclude)?;
     }
     srcs.sort_by(|a, b| (a.inc, ext_key(&a.name), &a.name).cmp(&(b.inc, ext_key(&b.name), &b.name)));
     let n_plain = srcs.iter().filter(|s| !s.inc).count();
@@ -210,7 +232,7 @@ pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>, usiz
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long"));
         }
     }
-    let head_len: usize = 8 + srcs.iter().map(|s| 2 + s.name.len() + 12).sum::<usize>();
+    let head_len: usize = 8 + srcs.iter().map(|s| 2 + s.name.len() + 20).sum::<usize>();
     let est: u64 = srcs
         .iter()
         .filter(|s| s.kind == KIND_FILE)
@@ -220,7 +242,7 @@ pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>, usiz
     buf.resize(head_len, 0);
 
     let mut head: Vec<u8> = Vec::with_capacity(head_len);
-    head.extend_from_slice(b"DLAR");
+    head.extend_from_slice(b"DLA2");
     head.extend_from_slice(&(srcs.len() as u32).to_le_bytes());
     let mut boundaries = Vec::with_capacity(srcs.len() + 1);
     boundaries.push(head_len);
@@ -248,6 +270,8 @@ pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>, usiz
         head.extend_from_slice(nb);
         head.extend_from_slice(&size.to_le_bytes());
         head.extend_from_slice(&mode.to_le_bytes());
+        let mtime = if s.kind == KIND_FILE { mtime_of(&md) } else { 0 };
+        head.extend_from_slice(&mtime.to_le_bytes());
         boundaries.push(buf.len());
     }
     debug_assert_eq!(head.len(), head_len);
@@ -258,9 +282,11 @@ pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>, usiz
 
 pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {
     let bad = || "corrupt archive payload".to_string();
-    if p.len() < 8 || &p[0..4] != b"DLAR" {
+    if p.len() < 8 || (&p[0..4] != b"DLAR" && &p[0..4] != b"DLA2") {
         return Err("payload is not a DLB archive".into());
     }
+    // DLAR (before 0.11) has no modification times
+    let extra = if &p[0..4] == b"DLA2" { 8usize } else { 0 };
     let count = u32::from_le_bytes(p[4..8].try_into().unwrap()) as usize;
     let mut pos = 8usize;
     let mut metas = Vec::new();
@@ -270,7 +296,7 @@ pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {
         }
         let nl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
         pos += 2;
-        if pos + nl + 12 > p.len() {
+        if pos + nl + 12 + extra > p.len() {
             return Err(bad());
         }
         let name = String::from_utf8_lossy(&p[pos..pos + nl]).to_string();
@@ -279,7 +305,14 @@ pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {
         pos += 8;
         let mode = u32::from_le_bytes(p[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        metas.push(Entry { name, size, mode });
+        let mtime = if extra > 0 {
+            let t = i64::from_le_bytes(p[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            t
+        } else {
+            0
+        };
+        metas.push(Entry { name, size, mode, mtime });
     }
     let mut out = Vec::with_capacity(count);
     for m in metas {
@@ -342,8 +375,29 @@ fn symlink_target_ok(link_rel: &Path, target: &str) -> bool {
 /// Symlinks are created last and only when they point inside `outdir`, so nothing can be
 /// written through a link that came from the archive.
 pub fn extract(entries: &[(Entry, &[u8])], outdir: &Path, force: bool) -> Result<usize, String> {
+    extract_with(entries, outdir, force, &|_| true)
+}
+
+fn set_mtime(path: &Path, secs: i64) {
+    if secs <= 0 {
+        return;
+    }
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+    let _ = fs::File::options().write(true).open(path).and_then(|f| f.set_modified(t));
+}
+
+/// Like [`extract`] but only for entries accepted by `select`.
+pub fn extract_with(
+    entries: &[(Entry, &[u8])],
+    outdir: &Path,
+    force: bool,
+    select: &dyn Fn(&Entry) -> bool,
+) -> Result<usize, String> {
     let mut n = 0;
     for (e, data) in entries {
+        if !select(e) {
+            continue;
+        }
         let rel = safe_rel(&e.name).ok_or_else(|| format!("unsafe path in archive: {}", e.name))?;
         let dest = outdir.join(&rel);
         match e.kind() {
@@ -369,6 +423,7 @@ pub fn extract(entries: &[(Entry, &[u8])], outdir: &Path, force: bool) -> Result
             fs::write(&dest, data)
         }
         .map_err(|x| format!("{}: {}", dest.display(), x))?;
+        set_mtime(&dest, e.mtime);
         #[cfg(unix)]
         if e.perms() != 0 {
             use std::os::unix::fs::PermissionsExt;
@@ -377,7 +432,7 @@ pub fn extract(entries: &[(Entry, &[u8])], outdir: &Path, force: bool) -> Result
         n += 1;
     }
     for (e, data) in entries {
-        if e.kind() != KIND_SYMLINK {
+        if e.kind() != KIND_SYMLINK || !select(e) {
             continue;
         }
         let rel = safe_rel(&e.name).ok_or_else(|| format!("unsafe path in archive: {}", e.name))?;
@@ -407,6 +462,53 @@ pub fn extract(entries: &[(Entry, &[u8])], outdir: &Path, force: bool) -> Result
         }
     }
     Ok(n)
+}
+
+/// Compares archive entries with files under `dir` (names resolve relative to it). Returns a
+/// list of human-readable differences; empty means everything matches.
+pub fn compare(entries: &[(Entry, &[u8])], dir: &Path, select: &dyn Fn(&Entry) -> bool) -> Vec<String> {
+    let mut diffs = Vec::new();
+    for (e, data) in entries {
+        if !select(e) {
+            continue;
+        }
+        let Some(rel) = safe_rel(&e.name) else {
+            diffs.push(format!("{}: unsafe name", e.name));
+            continue;
+        };
+        let p = dir.join(rel);
+        match e.kind() {
+            KIND_DIR => {
+                if !p.is_dir() {
+                    diffs.push(format!("{}: folder missing", e.name));
+                }
+            }
+            KIND_SYMLINK => match fs::read_link(&p) {
+                Ok(t) => {
+                    if t.to_string_lossy().replace('\\', "/") != String::from_utf8_lossy(data) {
+                        diffs.push(format!("{}: link target differs", e.name));
+                    }
+                }
+                Err(_) => diffs.push(format!("{}: link missing", e.name)),
+            },
+            _ => match fs::read(&p) {
+                Err(_) => diffs.push(format!("{}: missing", e.name)),
+                Ok(mut disk) => {
+                    // the archive holds filtered bytes for x86 executables: filter the disk
+                    // copy the same way instead of decoding every entry
+                    if e.x86_filtered() {
+                        x86_encode(&mut disk);
+                    }
+                    if disk.len() as u64 != e.size {
+                        diffs.push(format!("{}: size differs", e.name));
+                    } else if disk != *data {
+                        diffs.push(format!("{}: content differs", e.name));
+                    }
+                }
+            },
+        }
+    }
+    diffs
 }
 
 #[cfg(test)]
@@ -534,7 +636,7 @@ mod tests {
         assert!(!symlink_target_ok(Path::new("b"), ""));
         // a malicious archive: link "evil -> .." then file "evil/x" cannot hurt:
         let entries = vec![
-            (Entry { name: "evil".into(), size: 2, mode: KIND_SYMLINK << KIND_SHIFT }, &b".."[..]),
+            (Entry { name: "evil".into(), size: 2, mode: KIND_SYMLINK << KIND_SHIFT, mtime: 0 }, &b".."[..]),
         ];
         let d = tmp("evil");
         assert!(extract(&entries, &d, false).is_err());

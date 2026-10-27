@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../launch.dart';
 import '../strings.dart';
 import 'compress_page.dart';
 import 'extract_page.dart';
@@ -14,7 +15,8 @@ class Shell extends StatefulWidget {
 }
 
 class _ShellState extends State<Shell> {
-  int _index = 0;
+  // an archive passed on the command line opens the Extract tab
+  int _index = launchArchive.value != null ? 1 : 0;
 
   // IndexedStack keeps every page alive, so a running job survives tab switches.
   static const _pages = [CompressPage(), ExtractPage(), HelpPage()];

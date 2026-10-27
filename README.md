@@ -25,16 +25,34 @@ On another device: build or download the CLI for that platform (see CI below) an
 ## Command line
 
 ```
-dlb c [-l 1-10] [-t N] [-p PASS] [-k KEYFILE] [-o out.dlb] <file|dir>...   compress  (level 7 default: ~115 MB RAM per thread; 4: ~25 MB; 9: ~305 MB)
-dlb x [-t N] [-p PASS] [-k KEYFILE] <archive.dlb> [-C dir] [-f]           extract   (-f overwrites existing files)
-dlb t [-p PASS] <archive.dlb>               test integrity (CRC-32)
-dlb l [-p PASS] <archive.dlb>               list contents
+dlb c [options] <file|dir>...        compress into <first input>.dlb (or -o)
+dlb x [options] <archive> [select..] extract everything, or only entries matching select
+dlb t [options] <archive>            test integrity (CRC-32, and the password if any)
+dlb l [options] <archive> [select..] list contents with sizes and dates
+dlb i [options] <archive>            container info: blocks, sizes, ratio, model
+dlb cmp [options] <archive> [dir]    compare an archive with files on disk (backup check)
+dlb bench                            measure speed on this machine
+dlb completions bash|zsh|fish        shell completion script
 ```
 
-`-t N` sets the thread count (default: all cores, at most 8; `-t 0` = all cores, `-t 1` = single
-stream, best ratio). Memory grows with the number of threads. Several files or folders are packed into one *solid* archive (files are grouped by extension),
+| option | meaning |
+|---|---|
+| `-l N` | level 1-10 (default 7). RAM per thread: 4 ~25 MB, 7 ~115 MB, 9 ~305 MB, 10 (ultra) ~600 MB |
+| `-t N` | threads (default: all cores, at most 8; `0` = all cores; level 10 defaults to 1) |
+| `-x PATTERN` | (c) leave out matching files or folders, repeatable: `node_modules`, `*.tmp`, `proj/**/*.log` |
+| `-o FILE` / `-C DIR` / `-f` | output file (c) / extract folder (x) / overwrite (x) |
+| `-p PASS` / `-k FILE` | password / key file (see below) |
+| `-q` | quiet, no progress |
+
+Patterns (`-x` and the `select` arguments): `*` stays inside one folder, `**` crosses folders,
+`?` is one character. A pattern without `/` matches any path component (`*.rs`); with `/` it
+matches from the start of the archive path, and naming a folder selects everything in it.
+Examples: `dlb c -x .git -x node_modules proj/`, `dlb x backup.dlb 'proj/src' '*.md'`,
+`dlb cmp backup.dlb ~/restore-test` (exit status 1 if anything differs).
+
+Several files or folders are packed into one *solid* archive (files are grouped by extension),
 which noticeably improves the ratio. Extraction refuses paths that escape the target folder and
-never overwrites without `-f`.
+never overwrites without `-f`. File modification times are stored and restored.
 
 ## Results (level 7, single thread)
 
@@ -120,6 +138,14 @@ repeated, with copies landing in different blocks); without long-range duplicati
 cut the loss should be much smaller and shrinks as blocks get bigger. Use `-t 1` when ratio
 matters more than time. Decompression is parallel the same way.
 
+## Desktop integration
+
+`integration/linux/install.sh` registers the `.dlb` file type and adds right-click entries
+(Nautilus scripts, Dolphin service menu). `integration/windows/dlb-context-menu.reg` adds
+"Compress with DLB" and "Extract here" to Explorer (per user, edit the install path first).
+Both are small, readable files and are not tested on every desktop version. The Flutter app
+opens a `.dlb` passed on the command line directly in the Extract tab.
+
 ## Flutter app (`app/dlb_app`)
 
 A native-feeling UI over the same core, designed with the ui-ux-pro-max guidelines:
@@ -193,10 +219,11 @@ on any other.
 | 22 | 10 x n | block table: raw length u32, compressed length u32, flags u8 (bit 0: stored), `nbits` u8 |
 | ... | ... | the blocks' arithmetic-coder streams, back to back |
 
-Payload: `"DLAR"`, entry count, then per entry `name_len u16 | name | size u64 | mode u32`,
-followed by the data of all entries back to back. `mode`: bits 0-11 Unix permissions, bit 27 = x86
-filter applied, bits 28-31 = kind (0 file, 1 empty folder, 2 symlink whose data is the target
-path). Archives from before 0.8 are kind 0 without the filter and still read fine.
+Payload: `"DLA2"`, entry count, then per entry `name_len u16 | name | size u64 | mode u32 |
+mtime i64` (Unix seconds, 0 = unknown), followed by the data of all entries back to back. `mode`:
+bits 0-11 Unix permissions, bit 27 = x86 filter applied, bits 28-31 = kind (0 file, 1 empty
+folder, 2 symlink whose data is the target path). Payloads from before 0.11 (`"DLAR"`, no mtime
+field) are still read.
 
 ## Model
 
@@ -207,7 +234,7 @@ path). Archives from before 0.8 are kind 0 without the filter and still read fin
   second-layer mixer
 - 2 APM/SSE stages and a 32-bit arithmetic coder with 16-bit probabilities
 
-## Limits (version 0.1)
+## Limits
 
 - everything is processed in RAM: an archive is limited by memory, not by format (it is a
   sequence of blocks of under 4 GiB; 64-bit builds accept up to 1 TiB, 32-bit builds just under

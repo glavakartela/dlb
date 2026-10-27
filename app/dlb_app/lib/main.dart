@@ -1,14 +1,23 @@
+import 'dart:io';
+
 import 'package:dynamic_color/dynamic_color.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
+import 'launch.dart';
 import 'locale_controller.dart';
 import 'pages/shell.dart';
 import 'settings.dart';
 import 'theme.dart';
 
-Future<void> main() async {
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+  for (final a in args) {
+    if (a.toLowerCase().endsWith('.dlb') && File(a).existsSync()) {
+      launchArchive.value = a;
+      break;
+    }
+  }
   await localeController.load();
   await AppSettings.load();
   runApp(const DlbApp());
