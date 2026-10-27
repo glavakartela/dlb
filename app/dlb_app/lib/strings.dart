@@ -132,8 +132,8 @@ class S {
       'JPEG, MP4, ZIP, encrypted and random data. That is a limit of theory, not of the program.');
   String get helpLimitsTitle => t('Ограничения', 'Limits');
   String get helpLimits => t(
-      'Один архив до 4 ГиБ. Файлы упаковываются вместе (solid), поэтому для извлечения одного файла распаковывается весь архив.',
-      'One archive up to 4 GiB. Files are packed together (solid), so extracting one file decompresses the whole archive.');
+      'Размер ограничен доступной памятью: всё обрабатывается в ОЗУ. Файлы упаковываются вместе (solid), поэтому для извлечения одного файла распаковывается весь архив.',
+      'Size is limited by available memory: everything is processed in RAM. Files are packed together (solid), so extracting one file decompresses the whole archive.');
   String get helpFormat => t('Формат', 'Format');
   // password protection
   String get passwordOptional => t('Пароль (необязательно)', 'Password (optional)');

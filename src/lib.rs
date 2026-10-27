@@ -36,8 +36,10 @@ pub const MAGIC: &[u8; 4] = b"DLB2";
 const V1_HEADER: usize = 18;
 const V2_HEADER: usize = 22;
 const V2_ENTRY: usize = 10;
-/// Match tables store 32-bit positions, so one archive is limited to just under 4 GiB.
-pub const MAX_PAYLOAD: usize = 0xFFFF_0000;
+/// Match tables store 32-bit positions, so every *block* is just under 4 GiB; an archive is a
+/// sequence of blocks, so on 64-bit systems it is only limited by RAM (1 TiB here).
+pub const MAX_BLOCK: usize = 0xFFFF_0000;
+pub const MAX_PAYLOAD: usize = if usize::BITS >= 64 { 1 << 40 } else { MAX_BLOCK };
 pub const DEFAULT_MIN_BLOCK: usize = 32 << 20;
 const MAX_BLOCKS: usize = 1 << 16;
 
@@ -86,10 +88,11 @@ pub fn plan_blocks(
 ) -> Vec<usize> {
     let threads = threads.max(1);
     let min_block = min_block.max(1);
-    if threads == 1 || total <= 2 * min_block {
+    if total <= MAX_BLOCK && (threads == 1 || total <= 2 * min_block) {
         return vec![total];
     }
-    let target = min_block.max(total.div_ceil(threads));
+    // a block (target + slack) must always fit the 32-bit match positions
+    let target = min_block.max(total.div_ceil(threads)).min(MAX_BLOCK / 5 * 4);
     let slack = target / 4;
     let mut ends = Vec::new();
     let mut start = 0usize;
@@ -490,6 +493,26 @@ mod tests {
         data.extend(text(120_000));
         let (_, nb) = rt(&data, 4, 30_000);
         assert!(nb >= 4);
+    }
+
+    #[test]
+    fn huge_inputs_are_split_into_valid_blocks() {
+        // no allocation: only the plan is checked
+        for threads in [1usize, 2, 16] {
+            let total = 10usize << 30; // 10 GiB (64-bit only)
+            if usize::BITS < 64 {
+                return;
+            }
+            let ends = plan_blocks(total, &[], threads, DEFAULT_MIN_BLOCK);
+            let mut prev = 0usize;
+            for &e in &ends {
+                assert!(e - prev <= MAX_BLOCK, "block too large with {} threads", threads);
+                assert!(e > prev);
+                prev = e;
+            }
+            assert_eq!(prev, total);
+            assert!(ends.len() >= 3);
+        }
     }
 
     #[test]

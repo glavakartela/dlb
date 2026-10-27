@@ -152,49 +152,56 @@ pub fn build_payload(paths: &[PathBuf]) -> io::Result<(Vec<u8>, Vec<usize>)> {
     }
     srcs.sort_by(|a, b| (ext_key(&a.name), &a.name).cmp(&(ext_key(&b.name), &b.name)));
 
-    let mut head: Vec<u8> = Vec::new();
+    // The header size is known from the names alone, so file data is appended straight into
+    // the final buffer (no second copy of the whole payload).
+    for s in &srcs {
+        if s.name.len() > u16::MAX as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long"));
+        }
+    }
+    let head_len: usize = 8 + srcs.iter().map(|s| 2 + s.name.len() + 12).sum::<usize>();
+    let est: u64 = srcs
+        .iter()
+        .filter(|s| s.kind == KIND_FILE)
+        .map(|s| fs::metadata(&s.path).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    let mut buf: Vec<u8> = Vec::with_capacity(head_len + est as usize + 4096);
+    buf.resize(head_len, 0);
+
+    let mut head: Vec<u8> = Vec::with_capacity(head_len);
     head.extend_from_slice(b"DLAR");
     head.extend_from_slice(&(srcs.len() as u32).to_le_bytes());
-    let mut data: Vec<u8> = Vec::new();
-    let mut sizes: Vec<usize> = Vec::with_capacity(srcs.len());
+    let mut boundaries = Vec::with_capacity(srcs.len() + 1);
+    boundaries.push(head_len);
     for s in &srcs {
         let md = fs::symlink_metadata(&s.path)?;
         let mut mode = mode_of(&md) | (s.kind << KIND_SHIFT);
-        let bytes: Vec<u8> = match s.kind {
-            KIND_DIR => Vec::new(),
-            KIND_SYMLINK => fs::read_link(&s.path)?
-                .to_string_lossy()
-                .replace('\\', "/")
-                .into_bytes(),
+        let start = buf.len();
+        match s.kind {
+            KIND_DIR => {}
+            KIND_SYMLINK => buf.extend_from_slice(
+                fs::read_link(&s.path)?.to_string_lossy().replace('\\', "/").as_bytes(),
+            ),
             _ => {
-                let mut b = fs::read(&s.path)?;
-                if is_x86_executable(&b) {
-                    x86_encode(&mut b);
+                use std::io::Read;
+                fs::File::open(&s.path)?.read_to_end(&mut buf)?;
+                if is_x86_executable(&buf[start..]) {
+                    x86_encode(&mut buf[start..]);
                     mode |= FLAG_X86;
                 }
-                b
             }
-        };
-        let nb = s.name.as_bytes();
-        if nb.len() > u16::MAX as usize {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long"));
         }
+        let size = (buf.len() - start) as u64;
+        let nb = s.name.as_bytes();
         head.extend_from_slice(&(nb.len() as u16).to_le_bytes());
         head.extend_from_slice(nb);
-        head.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        head.extend_from_slice(&size.to_le_bytes());
         head.extend_from_slice(&mode.to_le_bytes());
-        sizes.push(bytes.len());
-        data.extend_from_slice(&bytes);
+        boundaries.push(buf.len());
     }
-    let mut boundaries = Vec::with_capacity(srcs.len() + 1);
-    let mut off = head.len();
-    boundaries.push(off);
-    for s in &sizes {
-        off += s;
-        boundaries.push(off);
-    }
-    head.extend_from_slice(&data);
-    Ok((head, boundaries))
+    debug_assert_eq!(head.len(), head_len);
+    buf[..head_len].copy_from_slice(&head);
+    Ok((buf, boundaries))
 }
 
 pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {

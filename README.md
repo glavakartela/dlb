@@ -201,8 +201,9 @@ path). Archives from before 0.8 are kind 0 without the filter and still read fin
 
 ## Limits (version 0.1)
 
-- one archive is at most 4 GiB and is processed in memory (add roughly 2x the data size to the
-  RAM figures above)
+- everything is processed in RAM: an archive is limited by memory, not by format (it is a
+  sequence of blocks of under 4 GiB; 64-bit builds accept up to 1 TiB, 32-bit builds just under
+  4 GiB). Plan for about the data size plus the per-thread model memory above
 - about 0.4 MB/s per thread; blocks run in parallel (see above)
 - no data-specific filters yet (x86 E8/E9, images, audio) and no built-in dictionary; these are
   the next steps for even stronger compression

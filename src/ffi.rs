@@ -123,7 +123,7 @@ pub unsafe extern "C" fn dlb_compress_start(
             return job.fail("cancelled".into());
         }
         if payload.len() > MAX_PAYLOAD {
-            return job.fail("input is larger than 4 GiB".into());
+            return job.fail("input is larger than the supported maximum".into());
         }
         job.in_bytes.store(payload.len() as u64, SeqCst);
         job.total.store(payload.len() as u64, SeqCst);

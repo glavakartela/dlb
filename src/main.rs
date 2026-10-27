@@ -133,7 +133,7 @@ fn main() {
             });
             let (payload, boundaries) = archive::build_payload(&inputs).unwrap_or_else(|e| fail(&e.to_string()));
             if payload.len() > dlbcore::MAX_PAYLOAD {
-                fail("input is larger than 4 GiB; split it into several archives");
+                fail("input is larger than the supported maximum");
             }
             let t0 = Instant::now();
             let mut pg = progress("compress", payload.len());

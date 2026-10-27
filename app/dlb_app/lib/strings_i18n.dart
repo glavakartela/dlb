@@ -109,8 +109,8 @@ const Map<String, Map<String, String>> kTr = {
         'JPEG, MP4, ZIP, зашифровані та випадкові дані. Це обмеження теорії, а не програми.',
     'Limits':
         'Обмеження',
-    'One archive up to 4 GiB. Files are packed together (solid), so extracting one file decompresses the whole archive.':
-        'Один архів до 4 ГіБ. Файли пакуються разом (solid), тому для добування одного файлу розпаковується весь архів.',
+    'Size is limited by available memory: everything is processed in RAM. Files are packed together (solid), so extracting one file decompresses the whole archive.':
+        'Розмір обмежений доступною пам’яттю: усе обробляється в ОЗП. Файли пакуються разом (solid), тому для добування одного файлу розпаковується весь архів.',
     'Format':
         'Формат',
     'Password (optional)':
@@ -249,8 +249,8 @@ const Map<String, Map<String, String>> kTr = {
         'JPEG, MP4, ZIP, verschlüsselte und zufällige Daten. Das ist eine Grenze der Theorie, nicht des Programms.',
     'Limits':
         'Grenzen',
-    'One archive up to 4 GiB. Files are packed together (solid), so extracting one file decompresses the whole archive.':
-        'Ein Archiv ist bis zu 4 GiB groß. Die Dateien werden gemeinsam gepackt (solid); um eine Datei zu entpacken, wird daher das ganze Archiv entpackt.',
+    'Size is limited by available memory: everything is processed in RAM. Files are packed together (solid), so extracting one file decompresses the whole archive.':
+        'Die Größe ist durch den verfügbaren Speicher begrenzt: alles wird im RAM verarbeitet. Die Dateien werden gemeinsam gepackt (solid); um eine Datei zu entpacken, wird daher das ganze Archiv entpackt.',
     'Format':
         'Format',
     'Password (optional)':
@@ -389,8 +389,8 @@ const Map<String, Map<String, String>> kTr = {
         'JPEG, MP4, ZIP, datos cifrados y aleatorios. Es un límite de la teoría, no del programa.',
     'Limits':
         'Límites',
-    'One archive up to 4 GiB. Files are packed together (solid), so extracting one file decompresses the whole archive.':
-        'Un archivo de hasta 4 GiB. Los archivos se empaquetan juntos (sólido), por lo que extraer uno descomprime todo el archivo.',
+    'Size is limited by available memory: everything is processed in RAM. Files are packed together (solid), so extracting one file decompresses the whole archive.':
+        'El tamaño está limitado por la memoria disponible: todo se procesa en RAM. Los archivos se empaquetan juntos (sólido), por lo que extraer uno descomprime todo el archivo.',
     'Format':
         'Formato',
     'Password (optional)':
@@ -529,8 +529,8 @@ const Map<String, Map<String, String>> kTr = {
         'JPEG、MP4、ZIP、加密数据和随机数据。这是理论上的限制,而不是程序的问题。',
     'Limits':
         '限制',
-    'One archive up to 4 GiB. Files are packed together (solid), so extracting one file decompresses the whole archive.':
-        '单个归档最大 4 GiB。文件被一起打包(固实),因此提取其中一个文件需要解压整个归档。',
+    'Size is limited by available memory: everything is processed in RAM. Files are packed together (solid), so extracting one file decompresses the whole archive.':
+        '大小受可用内存限制:所有内容都在内存中处理。文件被一起打包(固实),因此提取其中一个文件需要解压整个归档。',
     'Format':
         '格式',
     'Password (optional)':
