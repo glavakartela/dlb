@@ -17,13 +17,23 @@ USAGE:
   dlb t [-p PASS] <archive.dlb>               test integrity
   dlb l [-p PASS] <archive.dlb>               list contents
 
--p PASS encrypts (c) or decrypts (x/t/l) with a password; names and sizes are hidden too.
+-p PASS encrypts (c) or decrypts (x/t/l) with a password; -k FILE uses a key file instead of,
+or together with, the password (the file's SHA-256 is mixed in; keep the file safe!); names and sizes are hidden too.
 The DLB_PASSWORD environment variable works the same and keeps it out of `ps`. An encrypted
 archive without a password asks for one on stdin (the input is visible).
 ";
 
-fn password_from(arg: Option<String>) -> Option<String> {
-    arg.or_else(|| std::env::var("DLB_PASSWORD").ok()).filter(|p| !p.is_empty())
+/// Password (from -p or DLB_PASSWORD) and/or a key file (-k): the file's SHA-256 is appended
+/// to the password, so either one alone or both together unlock the archive.
+fn password_from(arg: Option<String>, keyfile: &Option<String>) -> Option<String> {
+    let mut pw = arg.or_else(|| std::env::var("DLB_PASSWORD").ok()).unwrap_or_default();
+    if let Some(k) = keyfile {
+        let data = std::fs::read(k).unwrap_or_else(|e| fail(&format!("{}: {}", k, e)));
+        for b in crypto::sha256(&data) {
+            pw.push_str(&format!("{:02x}", b));
+        }
+    }
+    if pw.is_empty() { None } else { Some(pw) }
 }
 
 fn ask_password() -> String {
@@ -74,6 +84,7 @@ fn main() {
             let mut out: Option<PathBuf> = None;
             let mut threads: Option<usize> = None;
             let mut pw_arg: Option<String> = None;
+            let mut keyfile: Option<String> = None;
             let mut min_block = dlbcore::DEFAULT_MIN_BLOCK;
             let mut inputs = Vec::new();
             let mut i = 1;
@@ -94,6 +105,10 @@ fn main() {
                     "-p" => {
                         i += 1;
                         pw_arg = Some(args.get(i).cloned().unwrap_or_else(|| fail("missing -p value")));
+                    }
+                    "-k" => {
+                        i += 1;
+                        keyfile = Some(args.get(i).cloned().unwrap_or_else(|| fail("missing -k value")));
                     }
                     "-b" => {
                         i += 1;
@@ -127,7 +142,7 @@ fn main() {
             opts.threads = threads.unwrap_or(if level >= 10 { 1 } else { auto_threads() });
             opts.min_block = min_block;
             let blob = compress_payload(&payload, &boundaries, &opts, &mut pg).expect("not cancellable");
-            let blob = match password_from(pw_arg) {
+            let blob = match password_from(pw_arg, &keyfile) {
                 Some(pw) => crypto::seal(&blob, &pw).unwrap_or_else(|e| fail(&e)),
                 None => blob,
             };
@@ -147,6 +162,7 @@ fn main() {
             let mut dir = PathBuf::from(".");
             let mut force = false;
             let mut pw_arg: Option<String> = None;
+            let mut keyfile: Option<String> = None;
             let mut threads = auto_threads();
             let mut i = 1;
             while i < args.len() {
@@ -160,6 +176,10 @@ fn main() {
                         i += 1;
                         pw_arg = Some(args.get(i).cloned().unwrap_or_else(|| fail("missing -p value")));
                     }
+                    "-k" => {
+                        i += 1;
+                        keyfile = Some(args.get(i).cloned().unwrap_or_else(|| fail("missing -k value")));
+                    }
                     "-t" => {
                         i += 1;
                         let n: usize = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| fail("bad -t"));
@@ -172,7 +192,7 @@ fn main() {
             let arc = arc.unwrap_or_else(|| fail("no archive given"));
             let blob = std::fs::read(&arc).unwrap_or_else(|e| fail(&format!("{}: {}", arc.display(), e)));
             let blob = if crypto::is_encrypted(&blob) {
-                let pw = password_from(pw_arg).unwrap_or_else(ask_password);
+                let pw = password_from(pw_arg, &keyfile).unwrap_or_else(ask_password);
                 eprintln!("decrypting...");
                 crypto::open(&blob, &pw).unwrap_or_else(|e| fail(&e))
             } else {
@@ -185,8 +205,14 @@ fn main() {
             match cmd {
                 "t" => println!("OK: {} files, {} bytes, CRC verified", entries.len(), payload.len()),
                 "l" => {
-                    for (e, _) in &entries {
-                        println!("{:>12}  {}", e.size, e.name);
+                    for (e, d) in &entries {
+                        match e.kind() {
+                            archive::KIND_DIR => println!("{:>12}  {}/", "<dir>", e.name),
+                            archive::KIND_SYMLINK => {
+                                println!("{:>12}  {} -> {}", "<link>", e.name, String::from_utf8_lossy(d))
+                            }
+                            _ => println!("{:>12}  {}", e.size, e.name),
+                        }
                     }
                 }
                 _ => {

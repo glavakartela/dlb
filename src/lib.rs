@@ -406,6 +406,42 @@ mod tests {
         rt(b"hello hello hello hello hello world", 1, DEFAULT_MIN_BLOCK);
     }
 
+    /// Poor man's fuzzing: damaged or random input must produce an error (or, for harmless
+    /// changes, a result), never a panic, hang or huge allocation.
+    #[test]
+    fn corrupt_input_never_panics() {
+        let mut x = 0xDEAD_BEEFu32;
+        let mut rnd = |m: usize| -> usize {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as usize % m
+        };
+        let data: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8 ^ (i / 97) as u8).collect();
+        let opts = Options { level: 3, threads: 2, min_block: 8_000 };
+        let blob = compress_payload(&data, &[], &opts, &mut |_| true).unwrap();
+        for round in 0..300 {
+            let mut b = blob.clone();
+            match round % 4 {
+                0 => {
+                    for _ in 0..1 + rnd(4) {
+                        let i = rnd(b.len());
+                        b[i] ^= 1 << rnd(8);
+                    }
+                }
+                1 => b.truncate(rnd(b.len())),
+                2 => {
+                    let i = rnd(40.min(b.len()));
+                    b[i] = rnd(256) as u8; // header / block table damage
+                }
+                _ => b = (0..rnd(200)).map(|_| rnd(256) as u8).collect(),
+            }
+            let _ = decompress_payload(&b, 2, &mut |_| true);
+            let _ = archive::parse_payload(&b);
+            let _ = crypto::open(&b, "pw");
+        }
+    }
+
     #[test]
     fn roundtrip_ultra_level() {
         let mut data = Vec::new();

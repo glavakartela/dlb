@@ -8,11 +8,25 @@ xz and zstd. It is the strongest practical approach to lossless compression; the
 (about 0.4 MB/s per thread). Large inputs are split into independent blocks that are compressed
 and decompressed on all CPU cores in parallel.
 
+## Quick start
+
+```
+dlb c project/                       # -> project.dlb  (level 7, all cores)
+dlb c -l 10 -t 1 project/            # strongest and slowest: single stream, ultra model
+dlb c -p "my password" project/      # encrypt (names and sizes hidden too)
+dlb x project.dlb                    # extract into the current folder
+dlb x project.dlb -C /somewhere -f   # elsewhere, overwriting
+dlb t project.dlb                    # verify integrity without extracting
+```
+
+On another device: build or download the CLI for that platform (see CI below) and run the same
+`dlb x`. Archives are bit-identical across x86, x64, arm and arm64, Linux, Windows, macOS and Android.
+
 ## Command line
 
 ```
-dlb c [-l 1-10] [-t N] [-p PASS] [-o out.dlb] <file|dir>...   compress  (level 7 default: ~115 MB RAM per thread; 4: ~25 MB; 9: ~305 MB)
-dlb x [-t N] [-p PASS] <archive.dlb> [-C dir] [-f]           extract   (-f overwrites existing files)
+dlb c [-l 1-10] [-t N] [-p PASS] [-k KEYFILE] [-o out.dlb] <file|dir>...   compress  (level 7 default: ~115 MB RAM per thread; 4: ~25 MB; 9: ~305 MB)
+dlb x [-t N] [-p PASS] [-k KEYFILE] <archive.dlb> [-C dir] [-f]           extract   (-f overwrites existing files)
 dlb t [-p PASS] <archive.dlb>               test integrity (CRC-32)
 dlb l [-p PASS] <archive.dlb>               list contents
 ```
@@ -51,7 +65,20 @@ large (about 550 MB). It is the strongest the program can do and is meant for a 
 versus level 7: source code -2%, executables -2.7%, text logs -14%, at about 1.6x the time.
 Gains are small on already tight data and large on structured, repetitive text.
 
+### What is stored
+
+Files, **empty folders and symbolic links** (Unix; on Windows links are listed but not recreated).
+On extraction a link is only created if its target stays inside the destination folder, and
+nothing is ever written through a link that came from the archive.
+
+x86 and x86-64 executables (PE and ELF) get a reversible **branch filter** (CALL/JMP E8/E9
+operands become absolute addresses) before modelling, which makes repeated call targets identical
+bytes. Measured at level 5 on 3 MB of real binaries: `python3` -8.8%, `git` -9.4%, `libc.so` -3.7%
+smaller output. Other files are untouched.
+
 ### Password protection
+
+`-k FILE` uses a key file (its SHA-256 is mixed into the password; alone or together with `-p`; lose the file and the data is gone).
 
 `dlb c -p PASS ...` (or the `DLB_PASSWORD` environment variable, which keeps the password out of
 `ps`) encrypts the finished archive. File names and sizes are hidden as well. Without `-p`, an
@@ -159,7 +186,9 @@ on any other.
 | ... | ... | the blocks' arithmetic-coder streams, back to back |
 
 Payload: `"DLAR"`, entry count, then per entry `name_len u16 | name | size u64 | mode u32`,
-followed by the data of all files back to back.
+followed by the data of all entries back to back. `mode`: bits 0-11 Unix permissions, bit 27 = x86
+filter applied, bits 28-31 = kind (0 file, 1 empty folder, 2 symlink whose data is the target
+path). Archives from before 0.8 are kind 0 without the filter and still read fine.
 
 ## Model
 
@@ -177,7 +206,6 @@ followed by the data of all files back to back.
 - about 0.4 MB/s per thread; blocks run in parallel (see above)
 - no data-specific filters yet (x86 E8/E9, images, audio) and no built-in dictionary; these are
   the next steps for even stronger compression
-- empty folders and symlinks are not stored
 
 ## Verification status
 
