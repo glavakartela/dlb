@@ -1037,6 +1037,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
+    /// entries of `sample_tree`: the symlink only exists on Unix
+    const ENTRIES: u64 = if cfg!(unix) { 9 } else { 8 };
+
     fn tmpdir(tag: &str) -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let d = std::env::temp_dir().join(format!(
@@ -1157,7 +1160,7 @@ mod tests {
         for (threads, block, pw) in [(1usize, 16_000usize, None), (3, 12_000, None), (2, 10_000, Some("pässwörd")), (1, 1 << 24, None)] {
             let arc = root.join(format!("t{}-{}.dlb", threads, block));
             let st = run_compress(&input, &arc, threads, block, pw);
-            assert!(st.out > 0 && st.files == 9, "{:?}", st);
+            assert!(st.out > 0 && st.files == ENTRIES, "{:?}", st);
             assert!(!part_path(&arc).exists());
             // streaming reader
             let dest = root.join(format!("out-{}-{}", threads, block));
@@ -1171,7 +1174,7 @@ mod tests {
             };
             let payload = crate::decompress_payload(&blob, 2, &mut |_| true).unwrap();
             let entries = archive::parse_payload(&payload).unwrap();
-            assert_eq!(entries.len(), 9);
+            assert_eq!(entries.len() as u64, ENTRIES);
             let d2 = root.join(format!("mem-{}-{}", threads, block));
             archive::extract(&entries, &d2, false).unwrap();
             same_tree(&root.join("proj"), &d2.join("proj"));
