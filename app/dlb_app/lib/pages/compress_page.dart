@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../format.dart';
 import '../job_runner.dart';
+import '../launch.dart';
 import '../platform.dart';
 import '../settings.dart';
 import '../strings.dart';
@@ -120,7 +121,13 @@ class _CompressPageState extends State<CompressPage> {
       onDragExited: (_) => setState(() => _dragging = false),
       onDragDone: (d) {
         setState(() => _dragging = false);
-        _add(d.files.map((f) => f.path));
+        final paths = d.files.map((f) => f.path).toList();
+        // a single .dlb file dropped here is meant to be opened, not packed
+        if (paths.length == 1 && paths.first.toLowerCase().endsWith('.dlb')) {
+          launchArchive.value = paths.first;
+          return;
+        }
+        _add(paths);
       },
       child: child,
     );

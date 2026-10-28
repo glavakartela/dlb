@@ -611,6 +611,36 @@ pub fn cm_compress(
     Some(enc.finish())
 }
 
+/// Incremental decoder: yields the payload from the start, on demand. Used to read an
+/// archive's entry table without decoding the data behind it.
+pub struct CmStream<'a> {
+    pred: Predictor,
+    dec: Decoder<'a>,
+    out: Vec<u8>,
+}
+
+impl<'a> CmStream<'a> {
+    pub fn new(comp: &'a [u8], nbits_byte: u32) -> Self {
+        CmStream { pred: Predictor::new(nbits_byte), dec: Decoder::new(comp), out: Vec::new() }
+    }
+
+    /// Decodes until at least `n` bytes are available (or `max` bytes in total).
+    pub fn extend_to(&mut self, n: usize, max: usize) -> &[u8] {
+        let n = n.min(max);
+        while self.out.len() < n {
+            let mut c = 0u32;
+            for _ in 0..8 {
+                let y = self.dec.decode(self.pred.p());
+                self.pred.update(y);
+                c = (c << 1) | y;
+            }
+            self.out.push(c as u8);
+            self.pred.end_byte(&self.out);
+        }
+        &self.out
+    }
+}
+
 /// Decodes exactly `out.len()` bytes into `out`. Returns false if cancelled.
 pub fn cm_decompress(
     comp: &[u8],

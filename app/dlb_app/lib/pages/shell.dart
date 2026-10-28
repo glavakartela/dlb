@@ -18,6 +18,22 @@ class _ShellState extends State<Shell> {
   // an archive passed on the command line opens the Extract tab
   int _index = launchArchive.value != null ? 1 : 0;
 
+  @override
+  void initState() {
+    super.initState();
+    launchArchive.addListener(_onLaunch);
+  }
+
+  @override
+  void dispose() {
+    launchArchive.removeListener(_onLaunch);
+    super.dispose();
+  }
+
+  void _onLaunch() {
+    if (launchArchive.value != null && _index != 1) setState(() => _index = 1);
+  }
+
   // IndexedStack keeps every page alive, so a running job survives tab switches.
   static const _pages = [CompressPage(), ExtractPage(), HelpPage()];
 

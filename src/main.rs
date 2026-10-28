@@ -306,34 +306,48 @@ fn cmd_archive(cmd: &str, a: Args) {
     if cmd == "i" {
         return cmd_info(&arc, &blob, encrypted, &a);
     }
-    let payload = read_payload(&blob, &a);
-    let entries = archive::parse_payload(&payload).unwrap_or_else(|e| fail(&e));
     let sel = selector(&pats);
-    match cmd {
-        "t" => println!("OK: {} entries, {} bytes, CRC verified", entries.len(), payload.len()),
-        "l" => {
-            let mut files = 0u64;
-            let mut total = 0u64;
-            for (e, d) in entries.iter().filter(|(e, _)| sel(e)) {
-                let when = if e.mtime > 0 { fmt_time(e.mtime) } else { "-".repeat(16) };
-                match e.kind() {
-                    archive::KIND_DIR => println!("{:>12}  {}  {}/", "<dir>", when, e.name),
-                    archive::KIND_SYMLINK => println!(
-                        "{:>12}  {}  {} -> {}",
-                        "<link>",
-                        when,
-                        e.name,
-                        String::from_utf8_lossy(d)
-                    ),
-                    _ => {
-                        files += 1;
-                        total += e.size;
-                        println!("{:>12}  {}  {}", e.size, when, e.name);
-                    }
+    if cmd == "l" {
+        // only the entry table is decoded, so this is fast even for huge archives
+        let (entries, _, _) = dlbcore::list_entries(&blob).unwrap_or_else(|e| fail(&e));
+        let mut files = 0u64;
+        let mut total = 0u64;
+        for e in entries.iter().filter(|e| sel(e)) {
+            let when = if e.mtime > 0 { fmt_time(e.mtime) } else { "-".repeat(16) };
+            match e.kind() {
+                archive::KIND_DIR => println!("{:>12}  {}  {}/", "<dir>", when, e.name),
+                archive::KIND_SYMLINK => println!("{:>12}  {}  {}", "<link>", when, e.name),
+                _ => {
+                    files += 1;
+                    total += e.size;
+                    println!("{:>12}  {}  {}", e.size, when, e.name);
                 }
             }
-            println!("{} files, {}", files, human(total));
         }
+        println!("{} files, {}", files, human(total));
+        return;
+    }
+    if cmd == "x" && !pats.is_empty() {
+        // selective: decode only the blocks (and only as far) as the chosen entries need
+        let (entries, _, _) = dlbcore::list_entries(&blob).unwrap_or_else(|e| fail(&e));
+        let idx: Vec<usize> =
+            entries.iter().enumerate().filter(|(_, e)| sel(e)).map(|(i, _)| i).collect();
+        if idx.is_empty() {
+            fail("nothing matched the given patterns");
+        }
+        let need: usize = idx.iter().map(|&i| entries[i].size as usize).sum();
+        let mut pg = progress("decompress", need, a.quiet);
+        let threads = a.threads.unwrap_or_else(auto_threads);
+        let dir = a.dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        let n = dlbcore::extract_selected(&blob, threads, &idx, &dir, a.force, &mut pg)
+            .unwrap_or_else(|e| fail(&e));
+        eprintln!("extracted {} entries to {}", n, dir.display());
+        return;
+    }
+    let payload = read_payload(&blob, &a);
+    let entries = archive::parse_payload(&payload).unwrap_or_else(|e| fail(&e));
+    match cmd {
+        "t" => println!("OK: {} entries, {} bytes, CRC verified", entries.len(), payload.len()),
         "cmp" => {
             let dir = PathBuf::from(a.pos.get(1).map(|s| s.as_str()).unwrap_or("."));
             let diffs = archive::compare(&entries, &dir, &sel);

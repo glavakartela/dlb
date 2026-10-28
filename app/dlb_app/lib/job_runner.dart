@@ -40,10 +40,15 @@ class JobRunner extends ChangeNotifier {
   }
 
   void startExtract(String archive, String? dest,
-      {bool force = false, String? password}) {
+      {bool force = false, String? password, List<int>? select}) {
     wasCompress = false;
     _begin(() => DlbNative.instance.startExtract(archive, dest,
-        force: force, password: password));
+        force: force, password: password, select: select));
+  }
+
+  void startList(String archive, {String? password}) {
+    wasCompress = false;
+    _begin(() => DlbNative.instance.startList(archive, password: password));
   }
 
   void _begin(NativeJob? Function() start) {

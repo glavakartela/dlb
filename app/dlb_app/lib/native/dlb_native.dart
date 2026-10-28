@@ -54,9 +54,11 @@ typedef _CompressStartC = Pointer<Void> Function(
 typedef _CompressStart = Pointer<Void> Function(
     Pointer<Pointer<Utf8>>, int, Pointer<Utf8>, int, int, Pointer<Utf8>);
 typedef _ExtractStartC = Pointer<Void> Function(
-    Pointer<Utf8>, Pointer<Utf8>, Uint8, Pointer<Utf8>);
+    Pointer<Utf8>, Pointer<Utf8>, Uint8, Pointer<Utf8>, Pointer<Utf8>);
 typedef _ExtractStart = Pointer<Void> Function(
-    Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Utf8>);
+    Pointer<Utf8>, Pointer<Utf8>, int, Pointer<Utf8>, Pointer<Utf8>);
+typedef _ListStartC = Pointer<Void> Function(Pointer<Utf8>, Pointer<Utf8>);
+typedef _ListStart = Pointer<Void> Function(Pointer<Utf8>, Pointer<Utf8>);
 typedef _ProbeC = Uint32 Function(Pointer<Utf8>);
 typedef _Probe = int Function(Pointer<Utf8>);
 typedef _PollC = Void Function(Pointer<Void>, Pointer<JobStatusNative>);
@@ -74,6 +76,7 @@ class DlbNative {
             lib.lookupFunction<_CompressStartC, _CompressStart>('dlb_compress_start'),
         _extract =
             lib.lookupFunction<_ExtractStartC, _ExtractStart>('dlb_extract_start'),
+        _list = lib.lookupFunction<_ListStartC, _ListStart>('dlb_list_start'),
         _probe = lib.lookupFunction<_ProbeC, _Probe>('dlb_probe'),
         _poll = lib.lookupFunction<_PollC, _Poll>('dlb_job_poll'),
         _message = lib.lookupFunction<_MessageC, _Message>('dlb_job_message'),
@@ -83,6 +86,7 @@ class DlbNative {
 
   final _CompressStart _compress;
   final _ExtractStart _extract;
+  final _ListStart _list;
   final _Probe _probe;
   final _Poll _poll;
   final _Message _message;
@@ -139,18 +143,38 @@ class DlbNative {
 
   /// [dest] == null only verifies integrity.
   NativeJob? startExtract(String archive, String? dest,
-      {bool force = false, String? password}) {
+      {bool force = false, String? password, List<int>? select}) {
     final a = archive.toNativeUtf8();
     final d = dest?.toNativeUtf8();
+    final sel = (select == null || select.isEmpty)
+        ? null
+        : select.join(',').toNativeUtf8();
     final pw = (password == null || password.isEmpty)
         ? null
         : password.toNativeUtf8();
     try {
-      final h = _extract(a, d ?? nullptr, force ? 1 : 0, pw ?? nullptr);
+      final h = _extract(
+          a, d ?? nullptr, force ? 1 : 0, pw ?? nullptr, sel ?? nullptr);
       return h == nullptr ? null : NativeJob._(this, h);
     } finally {
       calloc.free(a);
       if (d != null) calloc.free(d);
+      if (pw != null) calloc.free(pw);
+      if (sel != null) calloc.free(sel);
+    }
+  }
+
+  /// Reads the entry table; the job message is TSV (see `dlb_list_start`).
+  NativeJob? startList(String archive, {String? password}) {
+    final a = archive.toNativeUtf8();
+    final pw = (password == null || password.isEmpty)
+        ? null
+        : password.toNativeUtf8();
+    try {
+      final h = _list(a, pw ?? nullptr);
+      return h == nullptr ? null : NativeJob._(this, h);
+    } finally {
+      calloc.free(a);
       if (pw != null) calloc.free(pw);
     }
   }

@@ -20,6 +20,10 @@ pub struct Entry {
     pub mode: u32,
     /// modification time, seconds since the Unix epoch (0 = unknown)
     pub mtime: i64,
+    /// CRC-32 of the entry's stored data (0 for payloads before 0.12 and for folders)
+    pub crc: u32,
+    /// where the entry's data starts inside the payload
+    pub offset: u64,
 }
 
 impl Entry {
@@ -232,7 +236,7 @@ pub fn build_payload_ex(
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long"));
         }
     }
-    let head_len: usize = 8 + srcs.iter().map(|s| 2 + s.name.len() + 20).sum::<usize>();
+    let head_len: usize = 8 + srcs.iter().map(|s| 2 + s.name.len() + 24).sum::<usize>();
     let est: u64 = srcs
         .iter()
         .filter(|s| s.kind == KIND_FILE)
@@ -242,7 +246,7 @@ pub fn build_payload_ex(
     buf.resize(head_len, 0);
 
     let mut head: Vec<u8> = Vec::with_capacity(head_len);
-    head.extend_from_slice(b"DLA2");
+    head.extend_from_slice(b"DLA3");
     head.extend_from_slice(&(srcs.len() as u32).to_le_bytes());
     let mut boundaries = Vec::with_capacity(srcs.len() + 1);
     boundaries.push(head_len);
@@ -272,6 +276,7 @@ pub fn build_payload_ex(
         head.extend_from_slice(&mode.to_le_bytes());
         let mtime = if s.kind == KIND_FILE { mtime_of(&md) } else { 0 };
         head.extend_from_slice(&mtime.to_le_bytes());
+        head.extend_from_slice(&crate::crc32::crc32(&buf[start..]).to_le_bytes());
         boundaries.push(buf.len());
     }
     debug_assert_eq!(head.len(), head_len);
@@ -280,48 +285,82 @@ pub fn build_payload_ex(
     Ok((buf, boundaries, store_from))
 }
 
-pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {
+/// Result of [`parse_header`].
+pub enum HeaderParse {
+    /// all entries, and the length of the header (where the first entry's data starts)
+    Done(Vec<Entry>, usize),
+    /// the buffer is too short: at least this many bytes are needed to continue
+    NeedMore(usize),
+}
+
+/// Parses the entry table at the start of a payload. Works on a *prefix* of the payload, so a
+/// archive can be listed by decoding only the beginning of its first block.
+pub fn parse_header(p: &[u8]) -> Result<HeaderParse, String> {
     let bad = || "corrupt archive payload".to_string();
-    if p.len() < 8 || (&p[0..4] != b"DLAR" && &p[0..4] != b"DLA2") {
-        return Err("payload is not a DLB archive".into());
+    if p.len() < 8 {
+        return Ok(HeaderParse::NeedMore(8));
     }
-    // DLAR (before 0.11) has no modification times
-    let extra = if &p[0..4] == b"DLA2" { 8usize } else { 0 };
+    // DLAR (before 0.11): no mtime; DLA2: + mtime; DLA3 (0.12): + mtime and CRC-32
+    let extra = match &p[0..4] {
+        b"DLAR" => 0usize,
+        b"DLA2" => 8,
+        b"DLA3" => 12,
+        _ => return Err("payload is not a DLB archive".into()),
+    };
     let count = u32::from_le_bytes(p[4..8].try_into().unwrap()) as usize;
     let mut pos = 8usize;
-    let mut metas = Vec::new();
+    let mut metas = Vec::with_capacity(count.min(1 << 20));
     for _ in 0..count {
         if pos + 2 > p.len() {
-            return Err(bad());
+            return Ok(HeaderParse::NeedMore(pos + 2));
         }
         let nl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
-        pos += 2;
-        if pos + nl + 12 + extra > p.len() {
-            return Err(bad());
+        let need = pos + 2 + nl + 12 + extra;
+        if need > p.len() {
+            return Ok(HeaderParse::NeedMore(need));
         }
+        pos += 2;
         let name = String::from_utf8_lossy(&p[pos..pos + nl]).to_string();
         pos += nl;
         let size = u64::from_le_bytes(p[pos..pos + 8].try_into().unwrap());
         pos += 8;
         let mode = u32::from_le_bytes(p[pos..pos + 4].try_into().unwrap());
         pos += 4;
-        let mtime = if extra > 0 {
-            let t = i64::from_le_bytes(p[pos..pos + 8].try_into().unwrap());
+        let mut mtime = 0i64;
+        let mut crc = 0u32;
+        if extra >= 8 {
+            mtime = i64::from_le_bytes(p[pos..pos + 8].try_into().unwrap());
             pos += 8;
-            t
-        } else {
-            0
-        };
-        metas.push(Entry { name, size, mode, mtime });
+        }
+        if extra >= 12 {
+            crc = u32::from_le_bytes(p[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+        }
+        metas.push(Entry { name, size, mode, mtime, crc, offset: 0 });
     }
-    let mut out = Vec::with_capacity(count);
+    let header_len = pos;
+    let mut off = header_len as u64;
+    for m in metas.iter_mut() {
+        m.offset = off;
+        off = off.checked_add(m.size).ok_or_else(bad)?;
+    }
+    Ok(HeaderParse::Done(metas, header_len))
+}
+
+pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {
+    let bad = || "corrupt archive payload".to_string();
+    let (metas, _) = match parse_header(p)? {
+        HeaderParse::Done(m, h) => (m, h),
+        HeaderParse::NeedMore(_) => return Err(bad()),
+    };
+    let mut out = Vec::with_capacity(metas.len());
     for m in metas {
-        let end = pos.checked_add(m.size as usize).ok_or_else(bad)?;
+        let start = m.offset as usize;
+        let end = start.checked_add(m.size as usize).ok_or_else(bad)?;
         if end > p.len() {
             return Err(bad());
         }
-        out.push((m, &p[pos..end]));
-        pos = end;
+        out.push((m, &p[start..end]));
     }
     Ok(out)
 }
@@ -411,6 +450,9 @@ pub fn extract_with(
         }
         if dest.exists() && !force {
             return Err(format!("{} exists (use -f to overwrite)", dest.display()));
+        }
+        if e.crc != 0 && crate::crc32::crc32(data) != e.crc {
+            return Err(format!("checksum mismatch for {}", e.name));
         }
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|x| x.to_string())?;
@@ -636,7 +678,7 @@ mod tests {
         assert!(!symlink_target_ok(Path::new("b"), ""));
         // a malicious archive: link "evil -> .." then file "evil/x" cannot hurt:
         let entries = vec![
-            (Entry { name: "evil".into(), size: 2, mode: KIND_SYMLINK << KIND_SHIFT, mtime: 0 }, &b".."[..]),
+            (Entry { name: "evil".into(), size: 2, mode: KIND_SYMLINK << KIND_SHIFT, mtime: 0, crc: 0, offset: 0 }, &b".."[..]),
         ];
         let d = tmp("evil");
         assert!(extract(&entries, &d, false).is_err());

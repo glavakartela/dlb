@@ -160,6 +160,12 @@ A native-feeling UI over the same core, designed with the ui-ux-pro-max guidelin
 Screens: **Compress** (files or folder, drag and drop on desktop, three presets, progress with
 speed and ETA, cancel), **Extract** (with integrity check), **Help**.
 
+**Opening an archive shows its file list straight away**, like WinRAR or 7-Zip: double click a
+`.dlb` (or drop it on the window, or pick it), and the entries appear with checkboxes, search,
+select all / none and the size of the selection. "Extract selected" unpacks only the ticked
+entries. Encrypted archives ask for the password first. Listing only decodes the start of the
+data (the entry table is stored first), so it is fast even for multi-gigabyte archives.
+
 The app calls the Rust core through `dart:ffi` (`src/ffi.rs`). Work runs on a background thread,
 the UI polls progress, and cancelling is safe.
 
@@ -219,11 +225,20 @@ on any other.
 | 22 | 10 x n | block table: raw length u32, compressed length u32, flags u8 (bit 0: stored), `nbits` u8 |
 | ... | ... | the blocks' arithmetic-coder streams, back to back |
 
-Payload: `"DLA2"`, entry count, then per entry `name_len u16 | name | size u64 | mode u32 |
-mtime i64` (Unix seconds, 0 = unknown), followed by the data of all entries back to back. `mode`:
+Payload: `"DLA3"`, entry count, then per entry `name_len u16 | name | size u64 | mode u32 |
+mtime i64 | crc u32` (mtime in Unix seconds, 0 = unknown; the CRC-32 of each file lets partial
+extraction verify just the files it unpacks), followed by the data of all entries back to back. `mode`:
 bits 0-11 Unix permissions, bit 27 = x86 filter applied, bits 28-31 = kind (0 file, 1 empty
-folder, 2 symlink whose data is the target path). Payloads from before 0.11 (`"DLAR"`, no mtime
-field) are still read.
+folder, 2 symlink whose data is the target path). Older payloads (`"DLA2"` without per-file CRC, `"DLAR"` without mtime)
+are still read.
+
+## Determinism test
+
+`tests/golden.rs` compresses a fixed synthetic corpus at levels 1, 5 and 10 and pins the exact
+size and SHA-256 of each result (32829, 30235 and 29112 bytes). Every CI job that runs
+`cargo test` therefore checks that the output is bit-identical on that platform, which is the
+guarantee that an archive made on one architecture opens on any other. It doubles as a ratio
+log: a model change that makes things worse shows up as a bigger number.
 
 ## Model
 

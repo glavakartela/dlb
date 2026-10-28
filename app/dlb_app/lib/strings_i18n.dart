@@ -3,6 +3,24 @@
 
 const Map<String, Map<String, String>> kTr = {
   'uk': {
+    'Search files':
+        'Пошук файлів',
+    'Select all':
+        'Вибрати все',
+    'Clear selection':
+        'Зняти вибір',
+    'Extract selected':
+        'Розпакувати вибране',
+    'Reading archive…':
+        'Читання архіву…',
+    'Show contents':
+        'Показати вміст',
+    'Empty folder':
+        'Порожня тека',
+    'Link':
+        'Посилання',
+    'Nothing found':
+        'Нічого не знайдено',
     'Compress':
         'Стиснути',
     'Extract':
@@ -143,6 +161,24 @@ const Map<String, Map<String, String>> kTr = {
         'Мова',
   },
   'de': {
+    'Search files':
+        'Dateien suchen',
+    'Select all':
+        'Alle auswählen',
+    'Clear selection':
+        'Auswahl aufheben',
+    'Extract selected':
+        'Auswahl entpacken',
+    'Reading archive…':
+        'Archiv wird gelesen…',
+    'Show contents':
+        'Inhalt anzeigen',
+    'Empty folder':
+        'Leerer Ordner',
+    'Link':
+        'Link',
+    'Nothing found':
+        'Nichts gefunden',
     'Compress':
         'Komprimieren',
     'Extract':
@@ -283,6 +319,24 @@ const Map<String, Map<String, String>> kTr = {
         'Sprache',
   },
   'es': {
+    'Search files':
+        'Buscar archivos',
+    'Select all':
+        'Seleccionar todo',
+    'Clear selection':
+        'Quitar selección',
+    'Extract selected':
+        'Extraer selección',
+    'Reading archive…':
+        'Leyendo archivo…',
+    'Show contents':
+        'Mostrar contenido',
+    'Empty folder':
+        'Carpeta vacía',
+    'Link':
+        'Enlace',
+    'Nothing found':
+        'Nada encontrado',
     'Compress':
         'Comprimir',
     'Extract':
@@ -423,6 +477,24 @@ const Map<String, Map<String, String>> kTr = {
         'Idioma',
   },
   'zh': {
+    'Search files':
+        '搜索文件',
+    'Select all':
+        '全选',
+    'Clear selection':
+        '取消选择',
+    'Extract selected':
+        '解压所选',
+    'Reading archive…':
+        '正在读取压缩包…',
+    'Show contents':
+        '显示内容',
+    'Empty folder':
+        '空文件夹',
+    'Link':
+        '链接',
+    'Nothing found':
+        '未找到',
     'Compress':
         '压缩',
     'Extract':

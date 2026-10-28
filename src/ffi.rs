@@ -3,6 +3,7 @@
 
 use crate::{archive, auto_threads, crypto, compress_payload, decompress_payload, Options, MAX_PAYLOAD};
 use std::ffi::{c_char, CStr, CString};
+use crate::list_entries as dlb_list_entries;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
@@ -169,8 +170,13 @@ pub unsafe extern "C" fn dlb_extract_start(
     dest: *const c_char,
     force: u8,
     password: *const c_char,
+    select: *const c_char,
 ) -> *const Job {
     let password = cstr(password);
+    // comma separated entry indices (from dlb_list_start); NULL or empty = everything
+    let select: Option<Vec<usize>> = cstr(select).filter(|s| !s.trim().is_empty()).map(|s| {
+        s.split(',').filter_map(|t| t.trim().parse().ok()).collect()
+    });
     let arc = match cstr(archive_path) {
         Some(s) => PathBuf::from(s),
         None => return std::ptr::null(),
@@ -194,6 +200,31 @@ pub unsafe extern "C" fn dlb_extract_start(
         } else {
             blob
         };
+        if let (Some(sel), Some(d)) = (&select, &dest) {
+            // partial extraction: decode only what the chosen entries need
+            let total: u64 = match dlb_list_entries(&blob) {
+                Ok((entries, _, _)) => sel
+                    .iter()
+                    .filter_map(|&i| entries.get(i))
+                    .map(|e| e.size)
+                    .sum(),
+                Err(e) => return job.fail(e),
+            };
+            job.total.store(total, SeqCst);
+            job.in_bytes.store(blob.len() as u64, SeqCst);
+            job.phase.store(PHASE_CODING, SeqCst);
+            return match crate::extract_selected(&blob, auto_threads(), sel, d, force != 0, &mut |done| {
+                job.done.store(done as u64, SeqCst);
+                !job.cancel.load(SeqCst)
+            }) {
+                Ok(n) => {
+                    job.files.store(n as u64, SeqCst);
+                    job.out_bytes.store(total, SeqCst);
+                    job.finish(STATE_DONE, d.display().to_string())
+                }
+                Err(e) => job.fail(e),
+            };
+        }
         let total = blob
             .get(6..14)
             .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
@@ -222,6 +253,64 @@ pub unsafe extern "C" fn dlb_extract_start(
             job.finish(STATE_DONE, d.display().to_string());
         } else {
             job.finish(STATE_DONE, "verified".into());
+        }
+    })
+}
+
+/// Reads the entry table of an archive (fast: only the start of the data is decoded). On
+/// success the job message holds one line per entry: `kind<TAB>size<TAB>mtime<TAB>name`
+/// (kind 0 = file, 1 = empty folder, 2 = link; line number = entry index for
+/// `dlb_extract_start`'s `select`). `files` = entry count, `out_bytes` = total file bytes.
+///
+/// # Safety
+/// Pointers must be valid NUL-terminated UTF-8 strings (`password` may be NULL).
+#[no_mangle]
+pub unsafe extern "C" fn dlb_list_start(
+    archive_path: *const c_char,
+    password: *const c_char,
+) -> *const Job {
+    let arc = match cstr(archive_path) {
+        Some(s) => PathBuf::from(s),
+        None => return std::ptr::null(),
+    };
+    let password = cstr(password);
+    let job = Job::new();
+    spawn(&job, move |job| {
+        let blob = match std::fs::read(&arc) {
+            Ok(b) => b,
+            Err(e) => return job.fail(format!("{}: {}", arc.display(), e)),
+        };
+        job.in_bytes.store(blob.len() as u64, SeqCst);
+        job.phase.store(PHASE_CODING, SeqCst);
+        let blob = if crypto::is_encrypted(&blob) {
+            let pw = match &password {
+                Some(p) if !p.is_empty() => p,
+                _ => return job.fail(PASSWORD_REQUIRED.into()),
+            };
+            match crypto::open(&blob, pw) {
+                Ok(b) => b,
+                Err(e) => return job.fail(e),
+            }
+        } else {
+            blob
+        };
+        match dlb_list_entries(&blob) {
+            Ok((entries, total, _)) => {
+                let mut text = String::with_capacity(entries.len() * 64);
+                let mut bytes = 0u64;
+                for e in &entries {
+                    if e.kind() == archive::KIND_FILE {
+                        bytes += e.size;
+                    }
+                    let name = e.name.replace(['\t', '\n', '\r'], " ");
+                    text.push_str(&format!("{}\t{}\t{}\t{}\n", e.kind(), e.size, e.mtime, name));
+                }
+                job.total.store(total as u64, SeqCst);
+                job.out_bytes.store(bytes, SeqCst);
+                job.files.store(entries.len() as u64, SeqCst);
+                job.finish(STATE_DONE, text);
+            }
+            Err(e) => job.fail(e),
         }
     })
 }
@@ -301,7 +390,7 @@ pub unsafe extern "C" fn dlb_probe(path: *const c_char) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn dlb_version() -> u32 {
-    2
+    3
 }
 
 #[cfg(test)]
@@ -318,6 +407,13 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn msg_of_job(job: *const Job) -> String {
+        let m = unsafe { dlb_job_message(job) };
+        let s = unsafe { CStr::from_ptr(m) }.to_str().unwrap().to_string();
+        unsafe { dlb_string_free(m) };
+        s
     }
 
     #[test]
@@ -341,18 +437,36 @@ mod tests {
         unsafe { dlb_job_free(job) };
 
         let dest = CString::new(dir.join("out").to_str().unwrap()).unwrap();
-        let job = unsafe { dlb_extract_start(out.as_ptr(), dest.as_ptr(), 0, std::ptr::null()) };
+        let job = unsafe { dlb_extract_start(out.as_ptr(), dest.as_ptr(), 0, std::ptr::null(), std::ptr::null()) };
         assert_eq!(wait(job).state, STATE_DONE);
         unsafe { dlb_job_free(job) };
         assert_eq!(std::fs::read_to_string(dir.join("out/in/a.txt")).unwrap(), text);
 
         // verify-only
-        let job = unsafe { dlb_extract_start(out.as_ptr(), std::ptr::null(), 0, std::ptr::null()) };
+        let job = unsafe { dlb_extract_start(out.as_ptr(), std::ptr::null(), 0, std::ptr::null(), std::ptr::null()) };
         assert_eq!(wait(job).state, STATE_DONE);
         let m = unsafe { dlb_job_message(job) };
         assert_eq!(unsafe { CStr::from_ptr(m) }.to_str().unwrap(), "verified");
         unsafe { dlb_string_free(m) };
         unsafe { dlb_job_free(job) };
+
+        // list + selective extract through the job API
+        let job = unsafe { dlb_list_start(out.as_ptr(), std::ptr::null()) };
+        assert_eq!(wait(job).state, STATE_DONE);
+        let listing = msg_of_job(job);
+        unsafe { dlb_job_free(job) };
+        let lines: Vec<&str> = listing.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let want = lines.iter().position(|l| l.ends_with("sub/b.txt")).unwrap();
+        let sel = CString::new(want.to_string()).unwrap();
+        let dest2 = CString::new(dir.join("part").to_str().unwrap()).unwrap();
+        let job = unsafe {
+            dlb_extract_start(out.as_ptr(), dest2.as_ptr(), 0, std::ptr::null(), sel.as_ptr())
+        };
+        assert_eq!(wait(job).state, STATE_DONE);
+        unsafe { dlb_job_free(job) };
+        assert!(dir.join("part/in/sub/b.txt").exists());
+        assert!(!dir.join("part/in/a.txt").exists());
 
         // password protected archive
         let enc = CString::new(dir.join("enc.dlb").to_str().unwrap()).unwrap();
@@ -371,15 +485,15 @@ mod tests {
             unsafe { dlb_string_free(m) };
             s
         };
-        let job = unsafe { dlb_extract_start(enc.as_ptr(), std::ptr::null(), 0, std::ptr::null()) };
+        let job = unsafe { dlb_extract_start(enc.as_ptr(), std::ptr::null(), 0, std::ptr::null(), std::ptr::null()) };
         assert_eq!(wait(job).state, STATE_ERROR);
         assert_eq!(msg_of(job), PASSWORD_REQUIRED);
         unsafe { dlb_job_free(job) };
-        let job = unsafe { dlb_extract_start(enc.as_ptr(), std::ptr::null(), 0, bad.as_ptr()) };
+        let job = unsafe { dlb_extract_start(enc.as_ptr(), std::ptr::null(), 0, bad.as_ptr(), std::ptr::null()) };
         assert_eq!(wait(job).state, STATE_ERROR);
         assert_eq!(msg_of(job), crypto::ERR_BAD_PASSWORD);
         unsafe { dlb_job_free(job) };
-        let job = unsafe { dlb_extract_start(enc.as_ptr(), std::ptr::null(), 0, pw.as_ptr()) };
+        let job = unsafe { dlb_extract_start(enc.as_ptr(), std::ptr::null(), 0, pw.as_ptr(), std::ptr::null()) };
         assert_eq!(wait(job).state, STATE_DONE);
         unsafe { dlb_job_free(job) };
 

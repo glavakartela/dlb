@@ -403,6 +403,122 @@ fn parse_blocks(blob: &[u8]) -> Result<(usize, u32, Vec<BlockInfo<'_>>), String>
     Ok((total as usize, crc, blocks))
 }
 
+/// Entry table of a plain `.dlb` blob, read by decoding only the start of the first block, so
+/// listing an archive takes a moment even when its data is gigabytes. Returns the entries, the
+/// payload length and the header length (where the first entry's data starts).
+pub fn list_entries(blob: &[u8]) -> Result<(Vec<archive::Entry>, usize, usize), String> {
+    let (total, _crc, blocks) = parse_blocks(blob)?;
+    let b0 = blocks.first().ok_or_else(|| "corrupt header: no blocks".to_string())?;
+    let mut stream = if b0.stored { None } else { Some(cm::CmStream::new(b0.body, b0.nbits)) };
+    let mut want = 4096usize;
+    loop {
+        let buf: &[u8] = match stream.as_mut() {
+            Some(s) => s.extend_to(want, b0.raw),
+            None => b0.body,
+        };
+        match archive::parse_header(buf)? {
+            archive::HeaderParse::Done(entries, hl) => {
+                let end = entries.last().map_or(hl as u64, |e| e.offset + e.size);
+                if end > total as u64 {
+                    return Err("corrupt archive payload".into());
+                }
+                return Ok((entries, total, hl));
+            }
+            archive::HeaderParse::NeedMore(n) => {
+                if buf.len() >= b0.raw || n > b0.raw {
+                    // the entry table spans several blocks: decode everything instead
+                    let payload = decompress_payload(blob, auto_threads(), &mut |_| true)?;
+                    let (entries, hl) = match archive::parse_header(&payload)? {
+                        archive::HeaderParse::Done(e, h) => (e, h),
+                        archive::HeaderParse::NeedMore(_) => {
+                            return Err("corrupt archive payload".into())
+                        }
+                    };
+                    return Ok((entries, total, hl));
+                }
+                want = n.max(want.saturating_mul(2)).min(b0.raw);
+            }
+        }
+    }
+}
+
+/// Decodes only what is needed to read the given payload byte ranges: blocks that contain none
+/// of them are skipped and the others are decoded up to the last needed byte. The result has
+/// the full payload size; bytes that were not needed are zero. The whole-payload CRC cannot be
+/// checked here (entries carry their own CRC-32 for that).
+pub fn decompress_ranges(
+    blob: &[u8],
+    threads: usize,
+    ranges: &[(usize, usize)],
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>, String> {
+    let (total, _crc, blocks) = parse_blocks(blob)?;
+    let mut need = vec![0usize; blocks.len()];
+    let mut start = 0usize;
+    for (i, b) in blocks.iter().enumerate() {
+        let end = start + b.raw;
+        for &(a, e) in ranges {
+            if e > a && a < end && e > start {
+                need[i] = need[i].max(e.min(end) - start);
+            }
+        }
+        start = end;
+    }
+    let mut out = vec![0u8; total];
+    {
+        let mut slots: Vec<Mutex<&mut [u8]>> = Vec::with_capacity(blocks.len());
+        let mut rest: &mut [u8] = &mut out;
+        for b in &blocks {
+            let (head, tail) = rest.split_at_mut(b.raw);
+            slots.push(Mutex::new(head));
+            rest = tail;
+        }
+        let work = |i: usize, prog: &mut dyn FnMut(usize) -> bool| -> Option<()> {
+            let n = need[i];
+            if n == 0 {
+                return Some(());
+            }
+            let b = &blocks[i];
+            let mut dst = slots[i].lock().unwrap();
+            if b.stored {
+                dst[..n].copy_from_slice(&b.body[..n]);
+                prog(n);
+                Some(())
+            } else if cm::cm_decompress(b.body, &mut dst[..n], b.nbits, prog) {
+                Some(())
+            } else {
+                None
+            }
+        };
+        run_blocks(&need, threads, &work, progress).ok_or_else(|| "cancelled".to_string())?;
+    }
+    Ok(out)
+}
+
+/// Extracts only the entries whose index is in `select` (indices into [`list_entries`]).
+/// Decodes just the data those entries need. Every extracted file is checked against its own
+/// CRC-32 (archives written before 0.12 have none).
+pub fn extract_selected(
+    blob: &[u8],
+    threads: usize,
+    select: &[usize],
+    dest: &std::path::Path,
+    force: bool,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<usize, String> {
+    let (entries, _total, header_len) = list_entries(blob)?;
+    let mut ranges = vec![(0usize, header_len)];
+    let mut names = std::collections::HashSet::new();
+    for &i in select {
+        let e = entries.get(i).ok_or_else(|| "selection out of range".to_string())?;
+        ranges.push((e.offset as usize, (e.offset + e.size) as usize));
+        names.insert(e.name.clone());
+    }
+    let payload = decompress_ranges(blob, threads, &ranges, progress)?;
+    let all = archive::parse_payload(&payload)?;
+    archive::extract_with(&all, dest, force, &|e| names.contains(&e.name))
+}
+
 /// Decompresses a `.dlb` blob (DLB1 or DLB2) using up to `threads` workers.
 pub fn decompress_payload(
     blob: &[u8],
@@ -534,6 +650,49 @@ mod tests {
                 assert_eq!(decompress_payload(&b, 2, &mut |_| true).unwrap(), payload);
             }
         }
+    }
+
+    #[test]
+    fn list_and_partial_extract() {
+        let d = std::env::temp_dir().join(format!("dlb_part_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("in/sub")).unwrap();
+        for i in 0..40 {
+            let body: String = (0..300).map(|k| format!("file {} line {}\n", i, k % 7)).collect();
+            std::fs::write(d.join(format!("in/f{:02}.txt", i)), body).unwrap();
+        }
+        std::fs::write(d.join("in/sub/z.bin"), vec![7u8; 5000]).unwrap();
+        let (payload, bounds, sf) = archive::build_payload(&[d.join("in")]).unwrap();
+        // several blocks, so that partial decoding has something to skip
+        let opts = Options { level: 3, threads: 2, min_block: 40_000, store_from: sf };
+        let blob = compress_payload(&payload, &bounds, &opts, &mut |_| true).unwrap();
+        let (entries, total, hl) = list_entries(&blob).unwrap();
+        assert_eq!(total, payload.len());
+        assert_eq!(entries.len(), 41);
+        assert_eq!(entries[0].offset as usize, hl);
+        let pick: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.name.ends_with("f03.txt") || e.name.ends_with("z.bin"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(pick.len(), 2);
+        let out = d.join("out");
+        let n = extract_selected(&blob, 2, &pick, &out, false, &mut |_| true).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            std::fs::read(out.join("in/f03.txt")).unwrap(),
+            std::fs::read(d.join("in/f03.txt")).unwrap()
+        );
+        assert!(!out.join("in/f04.txt").exists());
+        // a damaged byte inside a selected entry is caught by its own CRC
+        let mut bad = payload.clone();
+        let e = &entries[pick[0]];
+        bad[e.offset as usize + 5] ^= 0x55;
+        let blob2 = compress_payload(&bad, &bounds, &opts, &mut |_| true).unwrap();
+        let err = extract_selected(&blob2, 1, &pick[..1], &d.join("out2"), false, &mut |_| true);
+        assert!(err.unwrap_err().contains("checksum"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

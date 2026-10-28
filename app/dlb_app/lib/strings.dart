@@ -161,6 +161,32 @@ class S {
     return raw;
   }
 
+  String get searchFiles => t('Поиск по файлам', 'Search files');
+  String get selectAll => t('Выбрать все', 'Select all');
+  String get selectNone => t('Снять выбор', 'Clear selection');
+  String get extractSelected => t('Распаковать выбранное', 'Extract selected');
+  String get readingArchive => t('Чтение архива…', 'Reading archive…');
+  String get showContents => t('Показать содержимое', 'Show contents');
+  String get emptyFolder => t('Пустая папка', 'Empty folder');
+  String get symlink => t('Ссылка', 'Link');
+  String get nothingFound => t('Ничего не найдено', 'Nothing found');
+  String selectedInfo(int n, int total, String size) => _p({
+        'en': '$n of $total selected · $size',
+        'ru': 'Выбрано $n из $total · $size',
+        'uk': 'Вибрано $n із $total · $size',
+        'de': '$n von $total ausgewählt · $size',
+        'es': '$n de $total seleccionados · $size',
+        'zh': '已选 $n / $total · $size',
+      });
+  String archiveInfo(int n, String size) => _p({
+        'en': '$n items · $size unpacked',
+        'ru': 'Элементов: $n · $size в распакованном виде',
+        'uk': 'Елементів: $n · $size у розпакованому вигляді',
+        'de': '$n Elemente · $size entpackt',
+        'es': '$n elementos · $size descomprimido',
+        'zh': '$n 项 · 解压后 $size',
+      });
+
   String get language => t('Язык', 'Language');
 
   static String _plural(int n, String one, String few, String many) {
