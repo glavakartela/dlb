@@ -1,4 +1,5 @@
 use dlbcore::archive::{self, Entry};
+use dlbcore::stream::{self, Stage};
 use dlbcore::{
     all_cores, auto_threads, compress_payload, crypto, decompress_payload, glob, inspect, Options,
 };
@@ -28,6 +29,11 @@ OPTIONS:
               10 = ULTRA (strongest, slowest, ~600 MB)
   -t N        threads (default: all cores, at most 8; 0 = all cores; level 10 defaults to 1).
               Large data is split into blocks, one per thread: faster, slightly weaker ratio
+  -M          low-memory mode (c): files are read from disk block by block and the archive
+              is written as it is produced, so RAM stays near  threads x (64 MB + model
+              tables) however large the input is. Uses one thread unless -t is given; the
+              ratio is slightly weaker because blocks do not share context. -b N sets the
+              block size in MB. (x t l always stream; with -M they also use one thread.)
   -x PATTERN  (c) leave out matching files/folders; repeatable. `node_modules`, `*.tmp`,
               `proj/**/*.log` ... (`*` stays inside a folder, `**` crosses folders)
   -o FILE     (c) output file
@@ -58,6 +64,7 @@ struct Args {
     level: Option<u32>,
     threads: Option<usize>,
     min_block: Option<usize>,
+    low_mem: bool,
     password: Option<String>,
     keyfile: Option<String>,
     out: Option<PathBuf>,
@@ -98,6 +105,7 @@ fn parse_args(argv: &[String]) -> Args {
                     let n: usize = value("-b").parse().unwrap_or_else(|_| fail("bad -b"));
                     a.min_block = Some(n.max(1) << 20);
                 }
+                "-M" | "--low-mem" => a.low_mem = true,
                 "-p" => a.password = Some(value("-p")),
                 "-k" => a.keyfile = Some(value("-k")),
                 "-o" => a.out = Some(PathBuf::from(value("-o"))),
@@ -164,10 +172,17 @@ fn fmt_dur(secs: f64) -> String {
 }
 
 fn progress(label: &'static str, total: usize, quiet: bool) -> impl FnMut(usize) -> bool {
+    let mut bar = bar(label, quiet);
+    move |done: usize| bar(done as u64, total as u64)
+}
+
+/// Progress line driven by `(done, total)`.
+fn bar(label: &'static str, quiet: bool) -> impl FnMut(u64, u64) -> bool {
     let tty = std::io::stderr().is_terminal() && !quiet;
     let t0 = Instant::now();
     let mut last = 0u64;
-    move |done: usize| {
+    move |done: u64, total: u64| {
+        let (done, total) = (done as usize, total as usize);
         if !tty {
             return true;
         }
@@ -248,6 +263,45 @@ fn read_payload(blob: &[u8], a: &Args) -> Vec<u8> {
     decompress_payload(blob, threads, &mut pg).unwrap_or_else(|e| fail(&e))
 }
 
+/// Progress callback for the streaming code: one line per stage.
+fn stage_bar(quiet: bool, coding: &'static str) -> impl FnMut(Stage, u64, u64) -> bool {
+    let mut cur: Option<(Stage, Box<dyn FnMut(u64, u64) -> bool>)> = None;
+    let tty = std::io::stderr().is_terminal() && !quiet;
+    let mut last_scan = Instant::now();
+    move |st: Stage, done: u64, total: u64| {
+        if cur.as_ref().map_or(true, |(s, _)| *s != st) {
+            if st == Stage::Scan {
+                cur = Some((st, Box::new(|_, _| true)));
+            } else {
+                let label = if st == Stage::Code { coding } else { "encrypt" };
+                cur = Some((st, Box::new(bar(label, quiet))));
+            }
+        }
+        if st == Stage::Scan {
+            if tty && last_scan.elapsed().as_millis() > 250 {
+                last_scan = Instant::now();
+                eprint!("\rscanning {:.0} MB      ", done as f64 / 1e6);
+                let _ = std::io::stderr().flush();
+            }
+            return true;
+        }
+        (cur.as_mut().unwrap().1)(done, total)
+    }
+}
+
+/// Opens an archive for streaming; asks for the password when it is encrypted and none was given.
+fn open_src(path: &PathBuf, a: &Args) -> Box<dyn stream::Source> {
+    let mut pw = password_from(a);
+    let mut bar = bar("verify", a.quiet);
+    loop {
+        match stream::open_source(path, pw.as_deref(), &mut bar) {
+            Ok(s) => return s,
+            Err(e) if e == stream::PASSWORD_REQUIRED && pw.is_none() => pw = Some(ask_password()),
+            Err(e) => fail(&e),
+        }
+    }
+}
+
 fn selector(pats: &[String]) -> impl Fn(&Entry) -> bool + '_ {
     move |e: &Entry| pats.is_empty() || glob::any_matches(pats, &e.name)
 }
@@ -268,6 +322,9 @@ fn cmd_compress(a: Args) {
         n.push(".dlb");
         PathBuf::from(n)
     });
+    if a.low_mem {
+        return compress_low_mem(&a, &inputs, &out, level);
+    }
     let (payload, boundaries, store_from) =
         archive::build_payload_ex(&inputs, &a.excludes).unwrap_or_else(|e| fail(&e.to_string()));
     if payload.len() > dlbcore::MAX_PAYLOAD {
@@ -298,21 +355,40 @@ fn cmd_compress(a: Args) {
     );
 }
 
-fn cmd_archive(cmd: &str, a: Args) {
-    let arc = PathBuf::from(a.pos.first().unwrap_or_else(|| fail("no archive given")));
-    let (blob, encrypted) = load_archive(&arc, &a);
-    let pats: Vec<String> = if cmd == "cmp" { Vec::new() } else { a.pos[1..].to_vec() };
+fn compress_low_mem(a: &Args, inputs: &[PathBuf], out: &PathBuf, level: u32) {
+    let pw = password_from(a);
+    let job = stream::CompressJob {
+        inputs,
+        exclude: &a.excludes,
+        out,
+        level,
+        threads: a.threads.unwrap_or(1),
+        block: a.min_block.unwrap_or(stream::LOW_MEM_BLOCK),
+        password: pw.as_deref(),
+    };
+    let t0 = Instant::now();
+    let mut pg = stage_bar(a.quiet, "compress");
+    let st = stream::compress_streaming(&job, &mut |_, _| {}, &mut pg).unwrap_or_else(|e| fail(&e));
+    eprintln!(
+        "{} -> {} bytes  (x{:.2})  {:.1}s  => {}  [low-memory mode]",
+        st.payload,
+        st.out,
+        st.payload as f64 / st.out.max(1) as f64,
+        t0.elapsed().as_secs_f64(),
+        out.display()
+    );
+}
 
-    if cmd == "i" {
-        return cmd_info(&arc, &blob, encrypted, &a);
-    }
+fn stream_archive(cmd: &str, a: &Args) {
+    let arc = PathBuf::from(&a.pos[0]);
+    let pats: Vec<String> = a.pos[1..].to_vec();
     let sel = selector(&pats);
+    let src = open_src(&arc, a);
+    let lst = stream::list_source(&*src).unwrap_or_else(|e| fail(&e));
     if cmd == "l" {
-        // only the entry table is decoded, so this is fast even for huge archives
-        let (entries, _, _) = dlbcore::list_entries(&blob).unwrap_or_else(|e| fail(&e));
         let mut files = 0u64;
         let mut total = 0u64;
-        for e in entries.iter().filter(|e| sel(e)) {
+        for e in lst.entries.iter().filter(|e| sel(e)) {
             let when = if e.mtime > 0 { fmt_time(e.mtime) } else { "-".repeat(16) };
             match e.kind() {
                 archive::KIND_DIR => println!("{:>12}  {}  {}/", "<dir>", when, e.name),
@@ -327,48 +403,62 @@ fn cmd_archive(cmd: &str, a: Args) {
         println!("{} files, {}", files, human(total));
         return;
     }
-    if cmd == "x" && !pats.is_empty() {
-        // selective: decode only the blocks (and only as far) as the chosen entries need
-        let (entries, _, _) = dlbcore::list_entries(&blob).unwrap_or_else(|e| fail(&e));
+    let select: Option<Vec<usize>> = if pats.is_empty() {
+        None
+    } else {
         let idx: Vec<usize> =
-            entries.iter().enumerate().filter(|(_, e)| sel(e)).map(|(i, _)| i).collect();
+            lst.entries.iter().enumerate().filter(|(_, e)| sel(e)).map(|(i, _)| i).collect();
         if idx.is_empty() {
             fail("nothing matched the given patterns");
         }
-        let need: usize = idx.iter().map(|&i| entries[i].size as usize).sum();
-        let mut pg = progress("decompress", need, a.quiet);
-        let threads = a.threads.unwrap_or_else(auto_threads);
-        let dir = a.dir.clone().unwrap_or_else(|| PathBuf::from("."));
-        let n = dlbcore::extract_selected(&blob, threads, &idx, &dir, a.force, &mut pg)
+        Some(idx)
+    };
+    let threads = a.threads.unwrap_or(if a.low_mem { 1 } else { auto_threads() });
+    let mut pg = stage_bar(a.quiet, "decompress");
+    if cmd == "t" {
+        let st = stream::extract_archive(&*src, None, false, select.as_deref(), threads, &mut pg)
             .unwrap_or_else(|e| fail(&e));
-        eprintln!("extracted {} entries to {}", n, dir.display());
-        return;
+        println!(
+            "OK: {} entries, {} bytes, {}",
+            lst.entries.len(),
+            st.payload,
+            if select.is_none() { "CRC verified" } else { "selected entries verified" }
+        );
+    } else {
+        let dir = a.dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        let st = stream::extract_archive(&*src, Some(&dir), a.force, select.as_deref(), threads, &mut pg)
+            .unwrap_or_else(|e| fail(&e));
+        eprintln!("extracted {} entries to {}", st.files, dir.display());
     }
+}
+
+fn cmd_archive(cmd: &str, a: Args) {
+    if a.pos.is_empty() {
+        fail("no archive given");
+    }
+    if matches!(cmd, "x" | "t" | "l") {
+        return stream_archive(cmd, &a);
+    }
+    let arc = PathBuf::from(a.pos.first().unwrap_or_else(|| fail("no archive given")));
+    let (blob, encrypted) = load_archive(&arc, &a);
+    if cmd == "i" {
+        return cmd_info(&arc, &blob, encrypted, &a);
+    }
+    // cmp: compare with files on disk (needs the whole payload in memory)
+    let pats: Vec<String> = Vec::new();
+    let sel = selector(&pats);
     let payload = read_payload(&blob, &a);
     let entries = archive::parse_payload(&payload).unwrap_or_else(|e| fail(&e));
-    match cmd {
-        "t" => println!("OK: {} entries, {} bytes, CRC verified", entries.len(), payload.len()),
-        "cmp" => {
-            let dir = PathBuf::from(a.pos.get(1).map(|s| s.as_str()).unwrap_or("."));
-            let diffs = archive::compare(&entries, &dir, &sel);
-            if diffs.is_empty() {
-                println!("identical: {} entries match {}", entries.len(), dir.display());
-            } else {
-                for d in &diffs {
-                    println!("{}", d);
-                }
-                println!("{} difference(s)", diffs.len());
-                exit(1);
-            }
+    let dir = PathBuf::from(a.pos.get(1).map(|s| s.as_str()).unwrap_or("."));
+    let diffs = archive::compare(&entries, &dir, &sel);
+    if diffs.is_empty() {
+        println!("identical: {} entries match {}", entries.len(), dir.display());
+    } else {
+        for d in &diffs {
+            println!("{}", d);
         }
-        _ => {
-            let dir = a.dir.clone().unwrap_or_else(|| PathBuf::from("."));
-            let n = archive::extract_with(&entries, &dir, a.force, &sel).unwrap_or_else(|e| fail(&e));
-            if n == 0 && !pats.is_empty() {
-                fail("nothing matched the given patterns");
-            }
-            eprintln!("extracted {} entries to {}", n, dir.display());
-        }
+        println!("{} difference(s)", diffs.len());
+        exit(1);
     }
 }
 
@@ -478,13 +568,13 @@ fn cmd_bench() {
 fn cmd_completions(shell: &str) {
     match shell {
         "bash" => print!(
-            "_dlb() {{\n  local cur=${{COMP_WORDS[COMP_CWORD]}}\n  if [ $COMP_CWORD -eq 1 ]; then\n    COMPREPLY=( $(compgen -W \"c x t l i cmp bench completions\" -- \"$cur\") )\n  else\n    COMPREPLY=( $(compgen -W \"-l -t -x -o -C -f -p -k -q -V\" -- \"$cur\") $(compgen -f -- \"$cur\") )\n  fi\n}}\ncomplete -F _dlb dlb\n"
+            "_dlb() {{\n  local cur=${{COMP_WORDS[COMP_CWORD]}}\n  if [ $COMP_CWORD -eq 1 ]; then\n    COMPREPLY=( $(compgen -W \"c x t l i cmp bench completions\" -- \"$cur\") )\n  else\n    COMPREPLY=( $(compgen -W \"-l -t -M -x -o -C -f -p -k -q -V\" -- \"$cur\") $(compgen -f -- \"$cur\") )\n  fi\n}}\ncomplete -F _dlb dlb\n"
         ),
         "zsh" => print!(
-            "#compdef dlb\n_arguments '1:command:(c x t l i cmp bench completions)' \\\n  '-l[level 1-10]:level:' '-t[threads]:threads:' '-x[exclude pattern]:pattern:' \\\n  '-o[output file]:file:_files' '-C[extract directory]:dir:_files -/' '-f[overwrite]' \\\n  '-p[password]:password:' '-k[key file]:file:_files' '-q[quiet]' '*:file:_files'\n"
+            "#compdef dlb\n_arguments '1:command:(c x t l i cmp bench completions)' \\\n  '-l[level 1-10]:level:' '-t[threads]:threads:' '-M[low-memory mode]' '-x[exclude pattern]:pattern:' \\\n  '-o[output file]:file:_files' '-C[extract directory]:dir:_files -/' '-f[overwrite]' \\\n  '-p[password]:password:' '-k[key file]:file:_files' '-q[quiet]' '*:file:_files'\n"
         ),
         "fish" => print!(
-            "complete -c dlb -n __fish_use_subcommand -a 'c x t l i cmp bench completions'\ncomplete -c dlb -s l -x -d 'level 1-10'\ncomplete -c dlb -s t -x -d 'threads'\ncomplete -c dlb -s x -x -d 'exclude pattern'\ncomplete -c dlb -s o -r -d 'output file'\ncomplete -c dlb -s C -r -d 'extract directory'\ncomplete -c dlb -s f -d 'overwrite'\ncomplete -c dlb -s p -x -d 'password'\ncomplete -c dlb -s k -r -d 'key file'\ncomplete -c dlb -s q -d 'quiet'\n"
+            "complete -c dlb -n __fish_use_subcommand -a 'c x t l i cmp bench completions'\ncomplete -c dlb -s l -x -d 'level 1-10'\ncomplete -c dlb -s t -x -d 'threads'\ncomplete -c dlb -s M -d 'low-memory mode'\ncomplete -c dlb -s x -x -d 'exclude pattern'\ncomplete -c dlb -s o -r -d 'output file'\ncomplete -c dlb -s C -r -d 'extract directory'\ncomplete -c dlb -s f -d 'overwrite'\ncomplete -c dlb -s p -x -d 'password'\ncomplete -c dlb -s k -r -d 'key file'\ncomplete -c dlb -s q -d 'quiet'\n"
         ),
         _ => fail("completions: bash, zsh or fish"),
     }

@@ -28,6 +28,7 @@ class _CompressPageState extends State<CompressPage> {
   final List<String> _items = [];
   int _level = AppSettings.level;
   bool _multi = AppSettings.multiCore;
+  bool _low = AppSettings.lowMemory;
   final TextEditingController _pw = TextEditingController();
   final TextEditingController _pw2 = TextEditingController();
   bool get _pwOk => _pw.text.isEmpty || _pw.text == _pw2.text;
@@ -88,7 +89,9 @@ class _CompressPageState extends State<CompressPage> {
     final cache = isAndroid ? (await getTemporaryDirectory()).path : null;
     final out = _customOut ?? _autoOut(cache);
     _runner.startCompress(List.of(_items), out, _level,
-        threads: (_multi && _level < 10) ? 0 : 1, password: _pw.text);
+        threads: (_multi && _level < 10 && !_low) ? 0 : 1,
+        password: _pw.text,
+        lowMemory: _low);
   }
 
   Future<void> _saveCopy() async {
@@ -342,16 +345,32 @@ class _CompressPageState extends State<CompressPage> {
               ),
             ),
             const SizedBox(height: 12),
-            Text(s.ramHint(_level, levelRamMb(_level)),
+            Text(
+                _low
+                    ? s.ramHint(_level, levelRamMb(_level) + lowMemExtraMb)
+                    : s.ramHint(_level, levelRamMb(_level)),
                 style: t.textTheme.bodyMedium),
             const SizedBox(height: 8),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
+              title: Text(s.lowMemory),
+              subtitle: Text(s.lowMemoryHint),
+              value: _low,
+              onChanged: busy
+                  ? null
+                  : (v) => setState(() {
+                        _low = v;
+                        AppSettings.lowMemory = v;
+                        AppSettings.save();
+                      }),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
               title: Text(s.multiCore),
               subtitle: Text(s.multiCoreHint),
-              value: _multi,
+              value: _multi && !_low,
               onChanged:
-                  (busy || _level >= 10)
+                  (busy || _level >= 10 || _low)
                       ? null
                       : (v) => setState(() {
                             _multi = v;

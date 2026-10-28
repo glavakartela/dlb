@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 class AppSettings {
   static int level = 7;
   static bool multiCore = true;
+  static bool lowMemory = false;
 
   static Future<File> _file() async {
     final dir = await getApplicationSupportDirectory();
@@ -25,6 +26,8 @@ class AppSettings {
         if (l is int && (l == 4 || l == 7 || l == 9 || l == 10)) level = l;
         final mc = m['multiCore'];
         if (mc is bool) multiCore = mc;
+        final lm = m['lowMemory'];
+        if (lm is bool) lowMemory = lm;
       }
     } catch (_) {
       // keep defaults
@@ -34,7 +37,8 @@ class AppSettings {
   static Future<void> save() async {
     try {
       await (await _file())
-          .writeAsString(jsonEncode({'level': level, 'multiCore': multiCore}));
+          .writeAsString(jsonEncode(
+          {'level': level, 'multiCore': multiCore, 'lowMemory': lowMemory}));
     } catch (_) {
       // not persisted
     }

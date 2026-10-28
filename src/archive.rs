@@ -195,6 +195,26 @@ fn ext_key(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Walks the inputs and returns every item in payload order (plain files grouped by extension,
+/// already-compressed ones last).
+fn collect(paths: &[PathBuf], exclude: &[String]) -> io::Result<Vec<Src>> {
+    let mut srcs = Vec::new();
+    for p in paths {
+        let base = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        walk(&base, p, &mut srcs, exclude)?;
+    }
+    srcs.sort_by(|a, b| (a.inc, ext_key(&a.name), &a.name).cmp(&(b.inc, ext_key(&b.name), &b.name)));
+    for s in &srcs {
+        if s.name.len() > u16::MAX as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path too long"));
+        }
+    }
+    Ok(srcs)
+}
+
 /// Read all inputs and build the solid payload. Files are grouped by extension
 /// so similar data sits together (better ratio).
 /// Already-compressed files (JPEG, MP4, ZIP, ...) are placed last. Returns the payload, the
@@ -218,15 +238,7 @@ pub fn build_payload_ex(
     paths: &[PathBuf],
     exclude: &[String],
 ) -> io::Result<(Vec<u8>, Vec<usize>, usize)> {
-    let mut srcs = Vec::new();
-    for p in paths {
-        let base = p
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-        walk(&base, p, &mut srcs, exclude)?;
-    }
-    srcs.sort_by(|a, b| (a.inc, ext_key(&a.name), &a.name).cmp(&(b.inc, ext_key(&b.name), &b.name)));
+    let srcs = collect(paths, exclude)?;
     let n_plain = srcs.iter().filter(|s| !s.inc).count();
 
     // The header size is known from the names alone, so file data is appended straight into
@@ -283,6 +295,208 @@ pub fn build_payload_ex(
     buf[..head_len].copy_from_slice(&head);
     let store_from = if n_plain < srcs.len() { boundaries[n_plain] } else { usize::MAX };
     Ok((buf, boundaries, store_from))
+}
+
+// ------------------------------------------------------------------ streaming (low memory)
+
+/// One item of a [`Plan`]: where its data sits in the virtual payload.
+pub struct Span {
+    pub path: PathBuf,
+    pub kind: u32,
+    /// payload offset of the first data byte
+    pub start: u64,
+    pub size: u64,
+    /// the x86 filter is applied when the file is read
+    pub x86: bool,
+    /// symlink target (the data of a symlink entry)
+    pub link: Vec<u8>,
+    /// size and mtime at planning time, to notice files that change while being compressed
+    pub mtime: i64,
+}
+
+/// An archive that has not been materialised: the entry table is in memory, file data is read
+/// from disk on demand. The payload is byte-identical to what [`build_payload_ex`] would build.
+pub struct Plan {
+    pub head: Vec<u8>,
+    pub spans: Vec<Span>,
+    pub boundaries: Vec<u64>,
+    pub total: u64,
+    /// payload offset where already-compressed files start (`u64::MAX` = none)
+    pub store_from: u64,
+}
+
+fn changed(p: &Path) -> String {
+    format!("file changed while compressing: {}", p.display())
+}
+
+/// Reads the whole file, applying the x86 filter when it is flagged.
+fn read_filtered(sp: &Span) -> Result<Vec<u8>, String> {
+    let mut v = fs::read(&sp.path).map_err(|e| format!("{}: {}", sp.path.display(), e))?;
+    if v.len() as u64 != sp.size {
+        return Err(changed(&sp.path));
+    }
+    if sp.x86 {
+        x86_encode(&mut v);
+    }
+    Ok(v)
+}
+
+impl Plan {
+    /// Appends payload bytes `a..b` to `out`.
+    pub fn read_range(&self, a: u64, b: u64, out: &mut Vec<u8>) -> Result<(), String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let head_len = self.head.len() as u64;
+        if a < head_len {
+            out.extend_from_slice(&self.head[a as usize..b.min(head_len) as usize]);
+        }
+        if b <= head_len {
+            return Ok(());
+        }
+        let first = self.spans.partition_point(|s| s.start + s.size <= a.max(head_len));
+        for sp in &self.spans[first..] {
+            if sp.start >= b {
+                break;
+            }
+            let from = a.max(sp.start) - sp.start;
+            let to = b.min(sp.start + sp.size) - sp.start;
+            if to <= from {
+                continue;
+            }
+            match sp.kind {
+                KIND_FILE => {
+                    if sp.x86 {
+                        let v = read_filtered(sp)?;
+                        out.extend_from_slice(&v[from as usize..to as usize]);
+                    } else {
+                        let mut f = fs::File::open(&sp.path)
+                            .map_err(|e| format!("{}: {}", sp.path.display(), e))?;
+                        f.seek(SeekFrom::Start(from)).map_err(|e| e.to_string())?;
+                        let len = (to - from) as usize;
+                        let at = out.len();
+                        out.resize(at + len, 0);
+                        f.read_exact(&mut out[at..]).map_err(|_| changed(&sp.path))?;
+                    }
+                }
+                KIND_SYMLINK => out.extend_from_slice(&sp.link[from as usize..to as usize]),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Fails if a source file no longer has the size or mtime it had when planned.
+    pub fn verify_unchanged(&self) -> Result<(), String> {
+        for sp in &self.spans {
+            if sp.kind != KIND_FILE {
+                continue;
+            }
+            let md = fs::metadata(&sp.path).map_err(|e| format!("{}: {}", sp.path.display(), e))?;
+            if md.len() != sp.size || mtime_of(&md) != sp.mtime {
+                return Err(changed(&sp.path));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Scans the inputs and computes the entry table without keeping file data in memory
+/// (one pass over every file for its CRC-32; flagged x86 files up to `x86_max` bytes are loaded
+/// one at a time for the filter). `progress` gets the number of bytes scanned so far.
+pub fn plan_files(
+    paths: &[PathBuf],
+    exclude: &[String],
+    x86_max: u64,
+    progress: &mut dyn FnMut(u64) -> bool,
+) -> Result<Plan, String> {
+    use std::io::Read;
+    let io = |p: &Path, e: io::Error| format!("{}: {}", p.display(), e);
+    let srcs = collect(paths, exclude).map_err(|e| e.to_string())?;
+    let n_plain = srcs.iter().filter(|s| !s.inc).count();
+    let head_len: u64 = 8 + srcs.iter().map(|s| 2 + s.name.len() as u64 + 24).sum::<u64>();
+
+    let mut head: Vec<u8> = Vec::with_capacity(head_len as usize);
+    head.extend_from_slice(b"DLA3");
+    head.extend_from_slice(&(srcs.len() as u32).to_le_bytes());
+    let mut spans = Vec::with_capacity(srcs.len());
+    let mut boundaries = vec![head_len];
+    let mut pos = head_len;
+    let mut scanned = 0u64;
+    let mut chunk = vec![0u8; 1 << 20];
+    for s in &srcs {
+        let md = fs::symlink_metadata(&s.path).map_err(|e| io(&s.path, e))?;
+        let mut mode = mode_of(&md) | (s.kind << KIND_SHIFT);
+        let mut link = Vec::new();
+        let mut crc = crate::crc32::Crc32::new();
+        let mut size = 0u64;
+        let mut x86 = false;
+        match s.kind {
+            KIND_DIR => {}
+            KIND_SYMLINK => {
+                link = fs::read_link(&s.path)
+                    .map_err(|e| io(&s.path, e))?
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .into_bytes();
+                size = link.len() as u64;
+                crc.update(&link);
+            }
+            _ => {
+                let mut f = fs::File::open(&s.path).map_err(|e| io(&s.path, e))?;
+                let mut first = true;
+                loop {
+                    let n = f.read(&mut chunk).map_err(|e| io(&s.path, e))?;
+                    if n == 0 {
+                        break;
+                    }
+                    if first {
+                        first = false;
+                        x86 = is_x86_executable(&chunk[..n]);
+                        if x86 && md.len() <= x86_max {
+                            // the filter needs the whole file: read it again in one piece
+                            let mut v = Vec::with_capacity(md.len() as usize);
+                            v.extend_from_slice(&chunk[..n]);
+                            f.read_to_end(&mut v).map_err(|e| io(&s.path, e))?;
+                            x86_encode(&mut v);
+                            crc.update(&v);
+                            size = v.len() as u64;
+                            scanned += size;
+                            break;
+                        }
+                        x86 = false;
+                    }
+                    crc.update(&chunk[..n]);
+                    size += n as u64;
+                    scanned += n as u64;
+                    if !progress(scanned) {
+                        return Err("cancelled".into());
+                    }
+                }
+                if size == 0 {
+                    x86 = false;
+                }
+                if x86 {
+                    mode |= FLAG_X86;
+                }
+                if !progress(scanned) {
+                    return Err("cancelled".into());
+                }
+            }
+        }
+        let nb = s.name.as_bytes();
+        head.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+        head.extend_from_slice(nb);
+        head.extend_from_slice(&size.to_le_bytes());
+        head.extend_from_slice(&mode.to_le_bytes());
+        let mtime = if s.kind == KIND_FILE { mtime_of(&md) } else { 0 };
+        head.extend_from_slice(&mtime.to_le_bytes());
+        head.extend_from_slice(&crc.finish().to_le_bytes());
+        spans.push(Span { path: s.path.clone(), kind: s.kind, start: pos, size, x86, link, mtime });
+        pos += size;
+        boundaries.push(pos);
+    }
+    debug_assert_eq!(head.len() as u64, head_len);
+    let store_from = if n_plain < srcs.len() { boundaries[n_plain] } else { u64::MAX };
+    Ok(Plan { head, spans, boundaries, total: pos, store_from })
 }
 
 /// Result of [`parse_header`].
@@ -365,7 +579,7 @@ pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {
     Ok(out)
 }
 
-fn safe_rel(name: &str) -> Option<PathBuf> {
+pub(crate) fn safe_rel(name: &str) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for part in name.split('/') {
         match Path::new(part).components().next() {
@@ -384,7 +598,7 @@ fn safe_rel(name: &str) -> Option<PathBuf> {
 
 /// True if a symlink at `link_rel` (relative to the output root) pointing at `target` stays
 /// inside the output root (checked lexically).
-fn symlink_target_ok(link_rel: &Path, target: &str) -> bool {
+pub(crate) fn symlink_target_ok(link_rel: &Path, target: &str) -> bool {
     let mut depth = link_rel.components().count().saturating_sub(1) as i64;
     if target.is_empty() {
         return false;
@@ -415,6 +629,16 @@ fn symlink_target_ok(link_rel: &Path, target: &str) -> bool {
 /// written through a link that came from the archive.
 pub fn extract(entries: &[(Entry, &[u8])], outdir: &Path, force: bool) -> Result<usize, String> {
     extract_with(entries, outdir, force, &|_| true)
+}
+
+/// Restores modification time and permissions of an extracted file.
+pub(crate) fn finish_file_meta(dest: &Path, e: &Entry) {
+    set_mtime(dest, e.mtime);
+    #[cfg(unix)]
+    if e.perms() != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dest, fs::Permissions::from_mode(e.perms()));
+    }
 }
 
 fn set_mtime(path: &Path, secs: i64) {
@@ -465,12 +689,7 @@ pub fn extract_with(
             fs::write(&dest, data)
         }
         .map_err(|x| format!("{}: {}", dest.display(), x))?;
-        set_mtime(&dest, e.mtime);
-        #[cfg(unix)]
-        if e.perms() != 0 {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(e.perms()));
-        }
+        finish_file_meta(&dest, e);
         n += 1;
     }
     for (e, data) in entries {
@@ -482,28 +701,42 @@ pub fn extract_with(
         if !symlink_target_ok(&rel, &target) {
             return Err(format!("unsafe symlink target in archive: {} -> {}", e.name, target));
         }
-        #[cfg(unix)]
-        {
-            let dest = outdir.join(&rel);
-            if fs::symlink_metadata(&dest).is_ok() {
-                if !force {
-                    return Err(format!("{} exists (use -f to overwrite)", dest.display()));
-                }
-                let _ = fs::remove_file(&dest);
-            }
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|x| x.to_string())?;
-            }
-            std::os::unix::fs::symlink(&target, &dest)
-                .map_err(|x| format!("{}: {}", dest.display(), x))?;
+        if create_symlink(outdir, &rel, &target, force)? {
             n += 1;
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = target; // symlinks are only restored on Unix-like systems
         }
     }
     Ok(n)
+}
+
+/// Creates one symlink below `outdir` (Unix only; elsewhere it does nothing and returns false).
+/// The caller has already checked the target with [`symlink_target_ok`].
+pub(crate) fn create_symlink(
+    outdir: &Path,
+    rel: &Path,
+    target: &str,
+    force: bool,
+) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let dest = outdir.join(rel);
+        if fs::symlink_metadata(&dest).is_ok() {
+            if !force {
+                return Err(format!("{} exists (use -f to overwrite)", dest.display()));
+            }
+            let _ = fs::remove_file(&dest);
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|x| x.to_string())?;
+        }
+        std::os::unix::fs::symlink(target, &dest)
+            .map_err(|x| format!("{}: {}", dest.display(), x))?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (outdir, rel, target, force); // symlinks are only restored on Unix-like systems
+        Ok(false)
+    }
 }
 
 /// Compares archive entries with files under `dir` (names resolve relative to it). Returns a

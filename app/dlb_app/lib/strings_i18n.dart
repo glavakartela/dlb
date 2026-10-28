@@ -3,6 +3,10 @@
 
 const Map<String, Map<String, String>> kTr = {
   'uk': {
+    'Low memory mode':
+        'Економія пам’яті',
+    'Files are read from disk in pieces and the archive is written as it goes, so little memory is needed even for huge data. One thread, slightly weaker compression.':
+        'Файли читаються з диска частинами, а архів пишеться одразу, тому пам’яті потрібно небагато навіть для величезних даних. Один потік, стиснення трохи слабше.',
     'Search files':
         'Пошук файлів',
     'Select all':
@@ -161,6 +165,10 @@ const Map<String, Map<String, String>> kTr = {
         'Мова',
   },
   'de': {
+    'Low memory mode':
+        'Speicherschonender Modus',
+    'Files are read from disk in pieces and the archive is written as it goes, so little memory is needed even for huge data. One thread, slightly weaker compression.':
+        'Dateien werden stückweise von der Platte gelesen und das Archiv sofort geschrieben, daher reicht wenig Speicher auch für riesige Datenmengen. Ein Thread, etwas schwächere Kompression.',
     'Search files':
         'Dateien suchen',
     'Select all':
@@ -319,6 +327,10 @@ const Map<String, Map<String, String>> kTr = {
         'Sprache',
   },
   'es': {
+    'Low memory mode':
+        'Modo de poca memoria',
+    'Files are read from disk in pieces and the archive is written as it goes, so little memory is needed even for huge data. One thread, slightly weaker compression.':
+        'Los archivos se leen del disco por partes y el archivo se escribe sobre la marcha, así que hace falta poca memoria incluso con datos enormes. Un hilo y compresión algo menor.',
     'Search files':
         'Buscar archivos',
     'Select all':
@@ -477,6 +489,10 @@ const Map<String, Map<String, String>> kTr = {
         'Idioma',
   },
   'zh': {
+    'Low memory mode':
+        '低内存模式',
+    'Files are read from disk in pieces and the archive is written as it goes, so little memory is needed even for huge data. One thread, slightly weaker compression.':
+        '文件分块从磁盘读取，压缩包边生成边写入，即使数据极大也只需很少内存。单线程，压缩率略低。',
     'Search files':
         '搜索文件',
     'Select all':

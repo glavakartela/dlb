@@ -27,6 +27,7 @@ pub mod glob;
 pub mod cm;
 pub mod crc32;
 pub mod ffi;
+pub mod stream;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::Mutex;

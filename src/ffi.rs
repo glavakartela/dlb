@@ -1,16 +1,16 @@
 //! C ABI used by the Flutter app (dart:ffi). Work runs on a background thread;
 //! the UI polls `dlb_job_poll` and may call `dlb_job_cancel`.
 
-use crate::{archive, auto_threads, crypto, compress_payload, decompress_payload, Options, MAX_PAYLOAD};
+use crate::stream::{self, Stage};
+use crate::{archive, auto_threads, compress_payload, crypto, Options, MAX_PAYLOAD};
 use std::ffi::{c_char, CStr, CString};
-use crate::list_entries as dlb_list_entries;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// Message of a failed extract job when the archive is encrypted and no password was given.
-pub const PASSWORD_REQUIRED: &str = "password required";
+pub const PASSWORD_REQUIRED: &str = stream::PASSWORD_REQUIRED;
 
 pub const STATE_RUNNING: u32 = 0;
 pub const STATE_DONE: u32 = 1;
@@ -88,7 +88,10 @@ fn spawn(job: &Arc<Job>, f: impl FnOnce(&Job) + Send + 'static) -> *const Job {
 }
 
 /// Start compressing `n` paths (files or folders) into `out_path`.
-/// `threads` = 0 picks a default (all cores, at most 8). `password` may be NULL.
+/// `threads` = 0 picks a default (all cores, at most 8; one in low-memory mode). `password` may
+/// be NULL. `flags` bit 0 = low-memory mode: files are read from disk block by block and the
+/// output is written as it is produced, so RAM stays small for any input size (slightly weaker
+/// ratio, see `stream`).
 ///
 /// # Safety
 /// `paths` must point to `n` valid NUL-terminated UTF-8 strings.
@@ -100,6 +103,7 @@ pub unsafe extern "C" fn dlb_compress_start(
     level: u32,
     threads: u32,
     password: *const c_char,
+    flags: u32,
 ) -> *const Job {
     // NULL or empty = no encryption
     let password = cstr(password).filter(|p| !p.is_empty());
@@ -114,8 +118,47 @@ pub unsafe extern "C" fn dlb_compress_start(
         Some(s) => PathBuf::from(s),
         None => return std::ptr::null(),
     };
+    let low_mem = flags & 1 != 0;
     let job = Job::new();
     spawn(&job, move |job| {
+        if low_mem {
+            let spec = stream::CompressJob {
+                inputs: &inputs,
+                exclude: &[],
+                out: &out,
+                level,
+                threads: if threads == 0 { 1 } else { threads as usize },
+                block: stream::LOW_MEM_BLOCK,
+                password: password.as_deref(),
+            };
+            let r = stream::compress_streaming(
+                &spec,
+                &mut |total, files| {
+                    job.total.store(total, SeqCst);
+                    job.in_bytes.store(total, SeqCst);
+                    job.files.store(files, SeqCst);
+                },
+                &mut |stage, done, total| {
+                    match stage {
+                        Stage::Scan => job.phase.store(PHASE_READING, SeqCst),
+                        Stage::Code => {
+                            job.phase.store(PHASE_CODING, SeqCst);
+                            job.total.store(total, SeqCst);
+                            job.done.store(done, SeqCst);
+                        }
+                        Stage::Finish => job.phase.store(PHASE_WRITING, SeqCst),
+                    }
+                    !job.cancel.load(SeqCst)
+                },
+            );
+            return match r {
+                Ok(st) => {
+                    job.out_bytes.store(st.out, SeqCst);
+                    job.finish(STATE_DONE, out.display().to_string())
+                }
+                Err(e) => job.fail(e),
+            };
+        }
         let (payload, boundaries, store_from) = match archive::build_payload(&inputs) {
             Ok(p) => p,
             Err(e) => return job.fail(e.to_string()),
@@ -184,75 +227,43 @@ pub unsafe extern "C" fn dlb_extract_start(
     let dest = cstr(dest).map(PathBuf::from);
     let job = Job::new();
     spawn(&job, move |job| {
-        let blob = match std::fs::read(&arc) {
-            Ok(b) => b,
-            Err(e) => return job.fail(format!("{}: {}", arc.display(), e)),
-        };
-        let blob = if crypto::is_encrypted(&blob) {
-            let pw = match &password {
-                Some(p) if !p.is_empty() => p,
-                _ => return job.fail(PASSWORD_REQUIRED.into()),
-            };
-            match crypto::open(&blob, pw) {
-                Ok(b) => b,
-                Err(e) => return job.fail(e),
-            }
-        } else {
-            blob
-        };
-        if let (Some(sel), Some(d)) = (&select, &dest) {
-            // partial extraction: decode only what the chosen entries need
-            let total: u64 = match dlb_list_entries(&blob) {
-                Ok((entries, _, _)) => sel
-                    .iter()
-                    .filter_map(|&i| entries.get(i))
-                    .map(|e| e.size)
-                    .sum(),
-                Err(e) => return job.fail(e),
-            };
+        job.in_bytes.store(std::fs::metadata(&arc).map_or(0, |m| m.len()), SeqCst);
+        // an encrypted archive is authenticated first (one pass over the file)
+        let src = match stream::open_source(&arc, password.as_deref(), &mut |done, total| {
             job.total.store(total, SeqCst);
-            job.in_bytes.store(blob.len() as u64, SeqCst);
-            job.phase.store(PHASE_CODING, SeqCst);
-            return match crate::extract_selected(&blob, auto_threads(), sel, d, force != 0, &mut |done| {
-                job.done.store(done as u64, SeqCst);
-                !job.cancel.load(SeqCst)
-            }) {
-                Ok(n) => {
-                    job.files.store(n as u64, SeqCst);
-                    job.out_bytes.store(total, SeqCst);
-                    job.finish(STATE_DONE, d.display().to_string())
-                }
-                Err(e) => job.fail(e),
-            };
-        }
-        let total = blob
-            .get(6..14)
-            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
-            .unwrap_or(0);
-        job.total.store(total, SeqCst);
-        job.in_bytes.store(blob.len() as u64, SeqCst);
-        job.phase.store(PHASE_CODING, SeqCst);
-        let payload = match decompress_payload(&blob, auto_threads(), &mut |d| {
-            job.done.store(d as u64, SeqCst);
+            job.done.store(done, SeqCst);
             !job.cancel.load(SeqCst)
         }) {
-            Ok(p) => p,
+            Ok(s) => s,
             Err(e) => return job.fail(e),
         };
-        job.out_bytes.store(payload.len() as u64, SeqCst);
-        let entries = match archive::parse_payload(&payload) {
-            Ok(e) => e,
-            Err(e) => return job.fail(e),
-        };
-        job.files.store(entries.len() as u64, SeqCst);
-        if let Some(d) = dest {
-            job.phase.store(PHASE_WRITING, SeqCst);
-            if let Err(e) = archive::extract(&entries, &d, force != 0) {
-                return job.fail(e);
+        job.done.store(0, SeqCst);
+        job.total.store(0, SeqCst);
+        let r = stream::extract_archive(
+            &*src,
+            dest.as_deref(),
+            force != 0,
+            select.as_deref(),
+            auto_threads(),
+            &mut |stage, done, total| {
+                if stage == Stage::Code {
+                    job.phase.store(PHASE_CODING, SeqCst);
+                    job.total.store(total, SeqCst);
+                    job.done.store(done, SeqCst);
+                }
+                !job.cancel.load(SeqCst)
+            },
+        );
+        match r {
+            Ok(st) => {
+                job.files.store(st.files, SeqCst);
+                job.out_bytes.store(st.bytes, SeqCst);
+                match &dest {
+                    Some(d) => job.finish(STATE_DONE, d.display().to_string()),
+                    None => job.finish(STATE_DONE, "verified".into()),
+                }
             }
-            job.finish(STATE_DONE, d.display().to_string());
-        } else {
-            job.finish(STATE_DONE, "verified".into());
+            Err(e) => job.fail(e),
         }
     })
 }
@@ -276,42 +287,29 @@ pub unsafe extern "C" fn dlb_list_start(
     let password = cstr(password);
     let job = Job::new();
     spawn(&job, move |job| {
-        let blob = match std::fs::read(&arc) {
-            Ok(b) => b,
-            Err(e) => return job.fail(format!("{}: {}", arc.display(), e)),
-        };
-        job.in_bytes.store(blob.len() as u64, SeqCst);
+        job.in_bytes.store(std::fs::metadata(&arc).map_or(0, |m| m.len()), SeqCst);
         job.phase.store(PHASE_CODING, SeqCst);
-        let blob = if crypto::is_encrypted(&blob) {
-            let pw = match &password {
-                Some(p) if !p.is_empty() => p,
-                _ => return job.fail(PASSWORD_REQUIRED.into()),
-            };
-            match crypto::open(&blob, pw) {
-                Ok(b) => b,
-                Err(e) => return job.fail(e),
-            }
-        } else {
-            blob
+        let lst = match stream::list_archive(&arc, password.as_deref(), &mut |done, total| {
+            job.total.store(total, SeqCst);
+            job.done.store(done, SeqCst);
+            !job.cancel.load(SeqCst)
+        }) {
+            Ok(l) => l,
+            Err(e) => return job.fail(e),
         };
-        match dlb_list_entries(&blob) {
-            Ok((entries, total, _)) => {
-                let mut text = String::with_capacity(entries.len() * 64);
-                let mut bytes = 0u64;
-                for e in &entries {
-                    if e.kind() == archive::KIND_FILE {
-                        bytes += e.size;
-                    }
-                    let name = e.name.replace(['\t', '\n', '\r'], " ");
-                    text.push_str(&format!("{}\t{}\t{}\t{}\n", e.kind(), e.size, e.mtime, name));
-                }
-                job.total.store(total as u64, SeqCst);
-                job.out_bytes.store(bytes, SeqCst);
-                job.files.store(entries.len() as u64, SeqCst);
-                job.finish(STATE_DONE, text);
+        let mut text = String::with_capacity(lst.entries.len() * 64);
+        let mut bytes = 0u64;
+        for e in &lst.entries {
+            if e.kind() == archive::KIND_FILE {
+                bytes += e.size;
             }
-            Err(e) => job.fail(e),
+            let name = e.name.replace(['\t', '\n', '\r'], " ");
+            text.push_str(&format!("{}\t{}\t{}\t{}\n", e.kind(), e.size, e.mtime, name));
         }
+        job.total.store(lst.total, SeqCst);
+        job.out_bytes.store(bytes, SeqCst);
+        job.files.store(lst.entries.len() as u64, SeqCst);
+        job.finish(STATE_DONE, text);
     })
 }
 
@@ -390,7 +388,7 @@ pub unsafe extern "C" fn dlb_probe(path: *const c_char) -> u32 {
 
 #[no_mangle]
 pub extern "C" fn dlb_version() -> u32 {
-    3
+    4
 }
 
 #[cfg(test)]
@@ -428,7 +426,7 @@ mod tests {
         let input = CString::new(dir.join("in").to_str().unwrap()).unwrap();
         let out = CString::new(dir.join("t.dlb").to_str().unwrap()).unwrap();
         let ptrs = [input.as_ptr()];
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out.as_ptr(), 3, 0, std::ptr::null()) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out.as_ptr(), 3, 0, std::ptr::null(), 0) };
         assert!(!job.is_null());
         let st = wait(job);
         assert_eq!(st.state, STATE_DONE);
@@ -472,7 +470,7 @@ mod tests {
         let enc = CString::new(dir.join("enc.dlb").to_str().unwrap()).unwrap();
         let pw = CString::new("s3cret pass").unwrap();
         let bad = CString::new("nope").unwrap();
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, enc.as_ptr(), 3, 0, pw.as_ptr()) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, enc.as_ptr(), 3, 0, pw.as_ptr(), 0) };
         assert_eq!(wait(job).state, STATE_DONE);
         unsafe { dlb_job_free(job) };
         assert_eq!(unsafe { dlb_probe(enc.as_ptr()) }, 2);
@@ -503,7 +501,7 @@ mod tests {
         let bigp = CString::new(dir.join("big.bin").to_str().unwrap()).unwrap();
         let out2 = CString::new(dir.join("big.dlb").to_str().unwrap()).unwrap();
         let ptrs = [bigp.as_ptr()];
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 7, 1, std::ptr::null()) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 7, 1, std::ptr::null(), 0) };
         std::thread::sleep(Duration::from_millis(300));
         unsafe { dlb_job_cancel(job) };
         assert_eq!(wait(job).state, STATE_CANCELLED);
@@ -513,9 +511,49 @@ mod tests {
         // error path
         let missing = CString::new("/nonexistent/zzz").unwrap();
         let ptrs = [missing.as_ptr()];
-        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 3, 0, std::ptr::null()) };
+        let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out2.as_ptr(), 3, 0, std::ptr::null(), 0) };
         assert_eq!(wait(job).state, STATE_ERROR);
         unsafe { dlb_job_free(job) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ffi_low_memory_mode() {
+        let dir = std::env::temp_dir().join(format!("dlb_ffi_lm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("in/sub")).unwrap();
+        let text: String = (0..3000).map(|i| format!("row {} of the low memory test\n", i % 89)).collect();
+        std::fs::write(dir.join("in/a.txt"), &text).unwrap();
+        std::fs::write(dir.join("in/sub/b.txt"), &text[..4000]).unwrap();
+        let input = CString::new(dir.join("in").to_str().unwrap()).unwrap();
+        let ptrs = [input.as_ptr()];
+        for pw in [None, Some("pw one")] {
+            let out = CString::new(dir.join("lm.dlb").to_str().unwrap()).unwrap();
+            let cpw = pw.map(|p| CString::new(p).unwrap());
+            let pp = cpw.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+            let job = unsafe { dlb_compress_start(ptrs.as_ptr(), 1, out.as_ptr(), 3, 0, pp, 1) };
+            let st = wait(job);
+            assert_eq!(st.state, STATE_DONE, "{}", msg_of_job(job));
+            assert_eq!(st.files, 2);
+            assert!(st.out_bytes > 0 && st.out_bytes < st.in_bytes);
+            unsafe { dlb_job_free(job) };
+            assert_eq!(unsafe { dlb_probe(out.as_ptr()) }, if pw.is_some() { 2 } else { 1 });
+
+            let job = unsafe { dlb_list_start(out.as_ptr(), pp) };
+            assert_eq!(wait(job).state, STATE_DONE);
+            let listing = msg_of_job(job);
+            unsafe { dlb_job_free(job) };
+            assert_eq!(listing.lines().count(), 2);
+
+            let dest = CString::new(dir.join("lm-out").to_str().unwrap()).unwrap();
+            let _ = std::fs::remove_dir_all(dir.join("lm-out"));
+            let job = unsafe { dlb_extract_start(out.as_ptr(), dest.as_ptr(), 0, pp, std::ptr::null()) };
+            assert_eq!(wait(job).state, STATE_DONE);
+            unsafe { dlb_job_free(job) };
+            assert_eq!(std::fs::read_to_string(dir.join("lm-out/in/a.txt")).unwrap(), text);
+            assert_eq!(std::fs::read_to_string(dir.join("lm-out/in/sub/b.txt")).unwrap(), &text[..4000]);
+        }
+        assert!(!dir.join("lm.dlb.part").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

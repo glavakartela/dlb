@@ -624,6 +624,12 @@ impl<'a> CmStream<'a> {
         CmStream { pred: Predictor::new(nbits_byte), dec: Decoder::new(comp), out: Vec::new() }
     }
 
+    /// Compressed bytes the decoder has read so far (it reads zeros past the end of its input,
+    /// so a value above the input length means the output may be wrong).
+    pub fn consumed(&self) -> usize {
+        self.dec.pos
+    }
+
     /// Decodes until at least `n` bytes are available (or `max` bytes in total).
     pub fn extend_to(&mut self, n: usize, max: usize) -> &[u8] {
         let n = n.min(max);

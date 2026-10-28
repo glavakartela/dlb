@@ -313,7 +313,7 @@ fn derive(password: &str, salt: &[u8], iterations: u32) -> ([u8; 32], [u8; 32]) 
     (enc, mac)
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -345,8 +345,80 @@ pub fn seal_with(
     out
 }
 
+/// ChaCha20 has a 32-bit block counter starting at 1: more than this many bytes under one
+/// key and nonce would repeat the keystream.
+pub const MAX_BODY: u64 = 64 * (u32::MAX as u64 - 1);
+const TOO_BIG: &str = "archive is too large to encrypt (limit 256 GiB)";
+
 /// Encrypts a finished `.dlb` blob with a password.
 pub fn seal(blob: &[u8], password: &str) -> Result<Vec<u8>, String> {
+    if password.is_empty() {
+        return Err("empty password".into());
+    }
+    if blob.len() as u64 > MAX_BODY {
+        return Err(TOO_BIG.into());
+    }
+    let mut salt = [0u8; 16];
+    let mut nonce = [0u8; 12];
+    random_bytes(&mut salt)?;
+    random_bytes(&mut nonce)?;
+    Ok(seal_with(blob, password, DEFAULT_ITERATIONS, salt, nonce))
+}
+
+// ---- streaming access to the envelope (used by `stream`: files too big for memory)
+
+/// Keys and nonce of one envelope.
+pub struct Keys {
+    enc: [u8; 32],
+    mac: [u8; 32],
+    nonce: [u8; 12],
+}
+
+/// Header size and tag size of the envelope.
+pub const ENVELOPE_HEADER: usize = HEADER;
+pub const ENVELOPE_TAG: usize = TAG;
+
+/// Incremental HMAC-SHA256.
+pub struct MacStream {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl MacStream {
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+    pub fn finish(mut self) -> [u8; 32] {
+        let ih = self.inner.finish();
+        self.outer.update(&ih);
+        self.outer.finish()
+    }
+}
+
+impl Keys {
+    pub fn mac_stream(&self) -> MacStream {
+        let h = Hmac::new(&self.mac);
+        MacStream { inner: h.inner, outer: h.outer }
+    }
+
+    /// XORs the keystream for the body bytes `offset..offset + data.len()` into `data`
+    /// (the same operation encrypts and decrypts).
+    pub fn xor_at(&self, offset: u64, data: &mut [u8]) {
+        let skip = (offset % 64) as usize;
+        let counter = 1u32.wrapping_add((offset / 64) as u32);
+        if skip == 0 {
+            chacha20_xor(&self.enc, &self.nonce, counter, data);
+        } else {
+            let mut tmp = vec![0u8; skip + data.len()];
+            tmp[skip..].copy_from_slice(data);
+            chacha20_xor(&self.enc, &self.nonce, counter, &mut tmp);
+            data.copy_from_slice(&tmp[skip..]);
+        }
+    }
+}
+
+/// Starts a new envelope: returns its 37-byte header and the keys.
+pub fn new_envelope(password: &str) -> Result<([u8; HEADER], Keys), String> {
     if password.is_empty() {
         return Err("empty password".into());
     }
@@ -354,7 +426,32 @@ pub fn seal(blob: &[u8], password: &str) -> Result<Vec<u8>, String> {
     let mut nonce = [0u8; 12];
     random_bytes(&mut salt)?;
     random_bytes(&mut nonce)?;
-    Ok(seal_with(blob, password, DEFAULT_ITERATIONS, salt, nonce))
+    let (enc, mac) = derive(password, &salt, DEFAULT_ITERATIONS);
+    let mut h = [0u8; HEADER];
+    h[0..4].copy_from_slice(MAGIC_ENC);
+    h[4] = VERSION;
+    h[5..9].copy_from_slice(&DEFAULT_ITERATIONS.to_le_bytes());
+    h[9..25].copy_from_slice(&salt);
+    h[25..37].copy_from_slice(&nonce);
+    Ok((h, Keys { enc, mac, nonce }))
+}
+
+/// Reads the header of an existing envelope and derives its keys (nothing is authenticated yet).
+pub fn read_envelope(header: &[u8], password: &str) -> Result<Keys, String> {
+    if header.len() < HEADER || !is_encrypted(header) {
+        return Err("not an encrypted DLB file".into());
+    }
+    if header[4] != VERSION {
+        return Err("unsupported encryption version".into());
+    }
+    let iterations = u32::from_le_bytes(header[5..9].try_into().unwrap());
+    if iterations == 0 || iterations > MAX_ITERATIONS {
+        return Err("corrupt encryption header".into());
+    }
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&header[25..37]);
+    let (enc, mac) = derive(password, &header[9..25], iterations);
+    Ok(Keys { enc, mac, nonce })
 }
 
 /// Decrypts an envelope produced by `seal`. Returns `ERR_BAD_PASSWORD` for a wrong password

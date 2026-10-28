@@ -33,10 +33,10 @@ class JobRunner extends ChangeNotifier {
   }
 
   void startCompress(List<String> paths, String out, int level,
-      {int threads = 0, String? password}) {
+      {int threads = 0, String? password, bool lowMemory = false}) {
     wasCompress = true;
     _begin(() => DlbNative.instance.startCompress(paths, out, level,
-        threads: threads, password: password));
+        threads: threads, password: password, lowMemory: lowMemory));
   }
 
   void startExtract(String archive, String? dest,

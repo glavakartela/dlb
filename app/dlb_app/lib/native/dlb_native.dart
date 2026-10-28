@@ -49,10 +49,10 @@ class JobSnapshot {
       total <= 0 ? null : (done / total).clamp(0.0, 1.0).toDouble();
 }
 
-typedef _CompressStartC = Pointer<Void> Function(
-    Pointer<Pointer<Utf8>>, IntPtr, Pointer<Utf8>, Uint32, Uint32, Pointer<Utf8>);
+typedef _CompressStartC = Pointer<Void> Function(Pointer<Pointer<Utf8>>, IntPtr,
+    Pointer<Utf8>, Uint32, Uint32, Pointer<Utf8>, Uint32);
 typedef _CompressStart = Pointer<Void> Function(
-    Pointer<Pointer<Utf8>>, int, Pointer<Utf8>, int, int, Pointer<Utf8>);
+    Pointer<Pointer<Utf8>>, int, Pointer<Utf8>, int, int, Pointer<Utf8>, int);
 typedef _ExtractStartC = Pointer<Void> Function(
     Pointer<Utf8>, Pointer<Utf8>, Uint8, Pointer<Utf8>, Pointer<Utf8>);
 typedef _ExtractStart = Pointer<Void> Function(
@@ -115,7 +115,7 @@ class DlbNative {
 
   /// Returns null when the arguments were rejected by the core.
   NativeJob? startCompress(List<String> paths, String outPath, int level,
-      {int threads = 0, String? password}) {
+      {int threads = 0, String? password, bool lowMemory = false}) {
     final arr = calloc<Pointer<Utf8>>(paths.length);
     final strs = <Pointer<Utf8>>[];
     final out = outPath.toNativeUtf8();
@@ -128,7 +128,8 @@ class DlbNative {
         strs.add(p);
         arr[i] = p;
       }
-      final h = _compress(arr, paths.length, out, level, threads, pw ?? nullptr);
+      final h = _compress(arr, paths.length, out, level, threads, pw ?? nullptr,
+          lowMemory ? 1 : 0);
       return h == nullptr ? null : NativeJob._(this, h);
     } finally {
       // the core copies all strings before returning

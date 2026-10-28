@@ -41,6 +41,10 @@ int levelRamMb(int level) {
   return (4 << nbits) ~/ mb + 2 * (4 << hbits) ~/ mb + 12;
 }
 
+/// Extra RAM of the low-memory mode on top of [levelRamMb]: one 64 MB block of input plus
+/// its compressed output and buffers (measured: level 1 peaks at 87 MB for any input size).
+const int lowMemExtraMb = 85;
+
 /// Next free name: `a.dlb`, `a (1).dlb`, ...
 String uniqueName(String name, bool Function(String) exists) {
   if (!exists(name)) return name;

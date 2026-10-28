@@ -39,6 +39,7 @@ dlb completions bash|zsh|fish        shell completion script
 |---|---|
 | `-l N` | level 1-10 (default 7). RAM per thread: 4 ~25 MB, 7 ~115 MB, 9 ~305 MB, 10 (ultra) ~600 MB |
 | `-t N` | threads (default: all cores, at most 8; `0` = all cores; level 10 defaults to 1) |
+| `-M` | (c) low-memory mode, see below |
 | `-x PATTERN` | (c) leave out matching files or folders, repeatable: `node_modules`, `*.tmp`, `proj/**/*.log` |
 | `-o FILE` / `-C DIR` / `-f` | output file (c) / extract folder (x) / overwrite (x) |
 | `-p PASS` / `-k FILE` | password / key file (see below) |
@@ -137,6 +138,42 @@ About 1.9x faster on 2 cores for ~8% larger output. That corpus is a worst case 
 repeated, with copies landing in different blocks); without long-range duplication across the
 cut the loss should be much smaller and shrinks as blocks get bigger. Use `-t 1` when ratio
 matters more than time. Decompression is parallel the same way.
+
+### Low-memory mode (`-M`, and a switch in the app)
+
+By default the whole payload is built in memory (plan for about twice the input size plus the
+model tables). With `-M` nothing is ever loaded whole: file data is read from disk one block at
+a time (64 MB, change with `-b N` megabytes), compressed, and appended to the output as soon as
+it is ready; the container header is filled in at the end, and an encrypted archive is
+encrypted in place. RAM stays at roughly `threads x (block + model tables)` whatever the input
+size, and the finished file is an ordinary `.dlb` that any version can open. Without `-t` it
+uses one thread. The output is written to `<name>.part` and renamed when complete, so a
+failure or cancel leaves no half-written archive, and a file that changes while it is being
+read makes the run fail instead of producing an archive with wrong content.
+
+The price is ratio: blocks do not share context, and files are read twice (a first pass
+computes each file's CRC-32 for the entry table). Measured on this machine:
+
+| input | | normal | `-M` |
+|---|---|---|---|
+| 1.2 GB incompressible (`.zip` extension, stored) | peak RAM, compress | 2296 MB | **40 MB** |
+| | peak RAM, extract | 524 MB | **100 MB** |
+| 110 MB source trees and docs, level 1 | peak RAM, compress | 146 MB | **87 MB** |
+| | archive size | 17,941,267 | 17,948,113 (+0.04%) |
+| | peak RAM, extract | 135 MB | **89 MB** |
+
+(The first row shows the point: the memory of `-M` does not grow with the input. In the
+second row the model tables are tiny at level 1; at level 7 or 9 they dominate and `-M` saves
+the data part only.) The loss in ratio is small on typical data and larger when similar files
+end up in different blocks.
+
+Extraction, testing and listing (`x`, `t`, `l`, and the app's file list) always work this way
+regardless of the flag: the archive is read with positional reads, listing decodes only the
+start of the first block, blocks are decoded one after another and files are written as the
+data arrives (only the files needing the x86 filter are held whole, one at a time). Memory
+is about one decoded block per thread: for archives made with `-M` that is 64 MB, for
+archives from the default mode it is the size of their blocks. Encrypted archives are
+authenticated with one pass over the file and then decrypted on the fly.
 
 ## Desktop integration
 
@@ -251,14 +288,24 @@ log: a model change that makes things worse shows up as a bigger number.
 
 ## Limits
 
-- everything is processed in RAM: an archive is limited by memory, not by format (it is a
-  sequence of blocks of under 4 GiB; 64-bit builds accept up to 1 TiB, 32-bit builds just under
-  4 GiB). Plan for about the data size plus the per-thread model memory above
+- default mode builds the payload in RAM: plan for about twice the data size plus the
+  per-thread model memory; use low-memory mode (`-M`) for inputs that do not fit. The format
+  itself is a sequence of blocks of under 4 GiB; 64-bit builds accept up to 1 TiB, 32-bit builds
+  just under 4 GiB (`dlb i` and `dlb cmp` still load the whole archive)
+- encrypted archives are limited to 256 GiB (ChaCha20's 32-bit block counter); larger ones are
+  refused instead of reusing the keystream
 - about 0.4 MB/s per thread; blocks run in parallel (see above)
-- no data-specific filters yet (x86 E8/E9, images, audio) and no built-in dictionary; these are
-  the next steps for even stronger compression
+- filters: only x86/x64 branch conversion for PE/ELF files; no image/audio models and no
+  built-in dictionary yet
 
 ## Verification status
+
+`cargo test` covers the streaming path as well: virtual payload equal to the in-memory one,
+round trips with several block sizes, thread counts and passwords, files from the in-memory
+writer read by the streaming reader and the other way round, wrong password and tampering,
+random corruption and truncation, cancel (no `.part` left) and a file modified during
+compression.
+
 
 The Rust core and the FFI layer are covered by `cargo test` (round trips, corruption detection,
 cancellation, error paths) and the C ABI was exercised from Python `ctypes`. The Flutter code

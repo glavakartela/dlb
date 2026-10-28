@@ -161,6 +161,10 @@ class S {
     return raw;
   }
 
+  String get lowMemory => t('Экономия памяти', 'Low memory mode');
+  String get lowMemoryHint => t(
+      'Файлы читаются с диска по частям и архив пишется сразу, поэтому памяти нужно немного даже для огромных данных. Один поток, сжатие чуть слабее.',
+      'Files are read from disk in pieces and the archive is written as it goes, so little memory is needed even for huge data. One thread, slightly weaker compression.');
   String get searchFiles => t('Поиск по файлам', 'Search files');
   String get selectAll => t('Выбрать все', 'Select all');
   String get selectNone => t('Снять выбор', 'Clear selection');
