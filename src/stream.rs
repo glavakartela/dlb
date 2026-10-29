@@ -12,7 +12,7 @@
 
 use crate::archive::{self, Entry, Plan, KIND_DIR, KIND_SYMLINK};
 use crate::crc32::{self, Crc32};
-use crate::{cm, crypto, level_to_nbits, MAGIC, MAGIC_V1, MAX_BLOCKS, MAX_PAYLOAD, V1_HEADER, V2_ENTRY, V2_HEADER};
+use crate::{cm, crypto, level_to_nbits, ERR_NEWER, MAGIC, MAGIC_V1, MODEL_VERSION, MAX_BLOCKS, MAX_PAYLOAD, V1_HEADER, V2_ENTRY, V2_HEADER};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -240,6 +240,9 @@ pub fn read_container(src: &dyn Source) -> Result<Container, String> {
     }
     let mut h = [0u8; V2_HEADER];
     src.read_at(0, &mut h)?;
+    if h[4] > MODEL_VERSION {
+        return Err(ERR_NEWER.into());
+    }
     let total = u64::from_le_bytes(h[6..14].try_into().unwrap());
     let crc = u32::from_le_bytes(h[14..18].try_into().unwrap());
     let n = u32::from_le_bytes(h[18..22].try_into().unwrap()) as usize;
@@ -713,7 +716,7 @@ fn compress_inner(
 
     let mut head = Vec::with_capacity(table_len);
     head.extend_from_slice(MAGIC);
-    head.push(0);
+    head.push(MODEL_VERSION);
     head.push(0);
     head.extend_from_slice(&total.to_le_bytes());
     head.extend_from_slice(&crc_total.to_le_bytes());

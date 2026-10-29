@@ -1,7 +1,7 @@
 name: dlb_app
 description: DLB - maximum-ratio file compressor (Flutter UI over the Rust core).
 publish_to: "none"
-version: 0.13.0+13
+version: 0.14.0+14
 
 environment:
   sdk: ">=3.6.0 <4.0.0"
@@ -27,3 +27,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - branding/png/icon-64.png

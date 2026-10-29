@@ -114,7 +114,7 @@ fn parse_args(argv: &[String]) -> Args {
                 "-f" => a.force = true,
                 "-q" => a.quiet = true,
                 "-V" | "--version" => {
-                    println!("dlb {}", VERSION);
+                    println!("dlb {} \"{}\"", VERSION, dlbcore::CODENAME);
                     exit(0);
                 }
                 "-h" | "--help" => {
@@ -592,7 +592,7 @@ fn main() {
         "x" | "t" | "l" | "i" | "cmp" => cmd_archive(cmd.as_str(), parse_args(rest)),
         "bench" => cmd_bench(),
         "completions" => cmd_completions(rest.first().map(|s| s.as_str()).unwrap_or("")),
-        "-V" | "--version" => println!("dlb {}", VERSION),
+        "-V" | "--version" => println!("dlb {} \"{}\"", VERSION, dlbcore::CODENAME),
         "-h" | "--help" | "help" => print!("{}", usage()),
         _ => {
             eprint!("{}", usage());

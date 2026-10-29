@@ -11,6 +11,15 @@ APP="${2:-}"
 install -Dm755 "$CLI" "$HOME/.local/bin/dlb"
 install -Dm644 "$HERE/dlb-mime.xml" "$HOME/.local/share/mime/packages/dlb-mime.xml"
 update-mime-database "$HOME/.local/share/mime" 2>/dev/null || true
+ICON="$HERE/../../app/dlb_app/branding"
+if [ -d "$ICON" ]; then
+  install -Dm644 "$ICON/linux/dlb.png" "$HOME/.local/share/icons/hicolor/256x256/apps/dlb.png"
+  for s in 16 32 48 64 128; do
+    install -Dm644 "$ICON/png/icon-$s.png" "$HOME/.local/share/icons/hicolor/${s}x${s}/apps/dlb.png"
+  done
+  install -Dm644 "$ICON/dlb.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/dlb.svg"
+  gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+fi
 if [ -n "$APP" ]; then
   sed "s|^Exec=dlb_app|Exec=$APP/dlb_app|" "$HERE/dlb.desktop" > /tmp/dlb.desktop.$$
   install -Dm644 /tmp/dlb.desktop.$$ "$HOME/.local/share/applications/dlb.desktop"

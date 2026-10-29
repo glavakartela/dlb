@@ -35,6 +35,13 @@ use std::time::Duration;
 
 pub const MAGIC_V1: &[u8; 4] = b"DLB1";
 pub const MAGIC: &[u8; 4] = b"DLB2";
+/// Release name (shown by `dlb -V` and in the app); the number is `CARGO_PKG_VERSION`.
+pub const CODENAME: &str = "Turbo Button";
+/// Context-mixing model used by this build, stored in byte 4 of a `DLB2` header. A future model
+/// gets the next number and old archives keep decoding with the old one; a reader that does not
+/// know the number refuses the archive instead of producing garbage.
+pub const MODEL_VERSION: u8 = 0;
+pub(crate) const ERR_NEWER: &str = "this archive was made by a newer DLB (unknown model): update the program";
 const V1_HEADER: usize = 18;
 const V2_HEADER: usize = 22;
 const V2_ENTRY: usize = 10;
@@ -297,7 +304,7 @@ pub fn compress_payload(
         .sum();
     let mut out = Vec::with_capacity(V2_HEADER + V2_ENTRY * blocks.len() + body_total);
     out.extend_from_slice(MAGIC);
-    out.push(0);
+    out.push(MODEL_VERSION);
     out.push(0);
     out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     out.extend_from_slice(&crc32::crc32(payload).to_le_bytes());
@@ -362,6 +369,9 @@ fn parse_blocks(blob: &[u8]) -> Result<(usize, u32, Vec<BlockInfo<'_>>), String>
     }
     if blob.len() < V2_HEADER {
         return corrupt("truncated");
+    }
+    if blob[4] > MODEL_VERSION {
+        return Err(ERR_NEWER.into());
     }
     let total = u64::from_le_bytes(blob[6..14].try_into().unwrap());
     let crc = u32::from_le_bytes(blob[14..18].try_into().unwrap());
@@ -583,6 +593,18 @@ mod tests {
             assert_eq!(d, data);
         }
         (c.len(), blocks)
+    }
+
+    #[test]
+    fn unknown_model_version_is_rejected_cleanly() {
+        let data = text(5000);
+        let mut blob = compress_payload(&data, &[], &Options::new(1), &mut |_| true).unwrap();
+        assert_eq!(blob[4], MODEL_VERSION);
+        assert_eq!(decompress_payload(&blob, 1, &mut |_| true).unwrap(), data);
+        blob[4] = MODEL_VERSION + 1;
+        let e = decompress_payload(&blob, 1, &mut |_| true).unwrap_err();
+        assert_eq!(e, ERR_NEWER);
+        assert_eq!(inspect(&blob).err().as_deref(), Some(ERR_NEWER));
     }
 
     #[test]

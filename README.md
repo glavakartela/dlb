@@ -1,3 +1,5 @@
+<p align="center"><img src="app/dlb_app/branding/png/icon-128.png" width="96" alt="DLB icon"></p>
+
 # DLB
 
 A maximum-ratio file compressor with its own `.dlb` format, written in pure Rust (no
@@ -183,6 +185,12 @@ authenticated with one pass over the file and then decrypted on the fly.
 Both are small, readable files and are not tested on every desktop version. The Flutter app
 opens a `.dlb` passed on the command line directly in the Extract tab.
 
+## Releases
+
+Versions are `MAJOR.MINOR.PATCH` and every release has a name (`dlb -V` prints both); see
+[CHANGELOG.md](CHANGELOG.md). The application icon is pixel art, drawn by
+`app/dlb_app/tools/make_icons.py` (output committed in `app/dlb_app/branding`).
+
 ## Flutter app (`app/dlb_app`)
 
 A native-feeling UI over the same core, designed with the ui-ux-pro-max guidelines:
@@ -255,7 +263,8 @@ on any other.
 | offset | size | field |
 |---|---|---|
 | 0 | 4 | magic `DLB2` |
-| 4 | 2 | reserved |
+| 4 | 1 | model version (0 = the current model; a reader that does not know the number refuses the archive) |
+| 5 | 1 | reserved (0) |
 | 6 | 8 | payload length |
 | 14 | 4 | CRC-32 of the whole payload |
 | 18 | 4 | block count `n` |

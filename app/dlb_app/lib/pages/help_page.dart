@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../format.dart';
 import '../locale_controller.dart';
 import '../strings.dart';
+import '../version.dart';
 import '../widgets/layout.dart';
 
 class HelpPage extends StatelessWidget {
@@ -18,6 +19,31 @@ class HelpPage extends StatelessWidget {
         padding: EdgeInsets.fromLTRB(g, 24, g, 32),
         children: [
           PageHeader(title: s.helpTitle, subtitle: 'DLB · context mixing'),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              ExcludeSemantics(
+                child: Image.asset(
+                  'branding/png/icon-64.png',
+                  width: 64,
+                  height: 64,
+                  filterQuality: FilterQuality.none,
+                ),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('DLB', style: t.textTheme.titleLarge),
+                    Text('v$kVersion · "$kCodename"',
+                        style: t.textTheme.bodyMedium?.copyWith(
+                            color: t.colorScheme.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 16),
           Card(
             child: Padding(
