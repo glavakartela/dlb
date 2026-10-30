@@ -5,12 +5,34 @@ Commit messages are in English: a short summary line (`feat:`, `fix:`, `perf:`, 
 `test:`, `ci:`), then a paragraph on what changed and why. Entries here are grouped as
 Added / Changed / Fixed.
 
+## 0.15.0 "Dial-up Dragon"
+
+### Added
+- Mutation fuzzing of every reader (`tests/fuzz.rs`): random bit flips, truncations, insertions
+  and extreme header values against plain, encrypted, streamed and in-memory archives, with
+  hang detection. `DLB_FUZZ_ITERS=50000 cargo test --release --test fuzz` runs it for long.
+- `tests/regress.rs` replays archives that once crashed or hung a reader (`tests/data`).
+- Windows builds refuse names Windows treats specially when extracting: device names
+  (`CON`, `NUL.txt`, `COM1`), alternate data streams (`a:b`), forbidden characters and
+  trailing dots or spaces.
+
+### Fixed
+- A damaged archive with a folder entry that claimed data made the extractor panic, and the
+  panic left the worker threads waiting forever (a hang). The pipeline now always releases its
+  workers and reports a panicking worker as an error.
+- Damaged or lying compressed streams are rejected as soon as the decoder runs past the end of
+  its input, instead of decoding garbage for as long as the declared length says.
+- The table size in a block header is limited to what the program can actually produce
+  (a forged value could ask for gigabytes of memory).
+- Extraction no longer restores setuid, setgid or sticky bits; an archive from someone else
+  extracted by root could otherwise create a setuid-root program.
+
 ## 0.14.0 "Turbo Button"
 
 ### Added
 - Pixel-art application icon (a zipped box in the style of 90s desktop shells) for Android
   (adaptive and themed), Windows, macOS and Linux; sources and generator in
-  `app/dlb_app/branding`
+  `app/dlb_app/branding` and `tools/make_icons.py`.
 - Release names: `dlb -V` prints `dlb 0.14.0 "Turbo Button"`, the app's Help page shows it, and
   `tests/version.rs` keeps Cargo.toml, pubspec.yaml, the Dart constants and this file in step.
 - Model version in the `DLB2` header (byte 4, currently 0). Future compression models will get

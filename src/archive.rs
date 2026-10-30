@@ -579,9 +579,38 @@ pub fn parse_payload(p: &[u8]) -> Result<Vec<(Entry, &[u8])>, String> {
     Ok(out)
 }
 
+/// True for a path component Windows would treat specially: device names (`CON`, `NUL.txt`,
+/// `COM1`, ...), alternate data streams and drive letters (`:`), characters it forbids, and
+/// trailing dots or spaces (which it silently drops). Extracting such a name there could write
+/// to a device or to a different file than the one named, so the Windows build refuses it.
+pub fn windows_name_unsafe(part: &str) -> bool {
+    if part.chars().any(|c| (c as u32) < 32 || "<>:\"|?*".contains(c)) {
+        return true;
+    }
+    if part.ends_with('.') || part.ends_with(' ') {
+        return true;
+    }
+    let stem = part.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    const RESERVED: [&str; 7] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"];
+    if RESERVED.contains(&stem.as_str()) {
+        return true;
+    }
+    for prefix in ["COM", "LPT"] {
+        if let Some(n) = stem.strip_prefix(prefix) {
+            if n.len() == 1 && n.as_bytes()[0].is_ascii_digit() && n != "0" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn safe_rel(name: &str) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for part in name.split('/') {
+        if cfg!(windows) && windows_name_unsafe(part) {
+            return None;
+        }
         match Path::new(part).components().next() {
             Some(Component::Normal(c)) if Path::new(part).components().count() == 1 => {
                 out.push(c)
@@ -635,9 +664,11 @@ pub fn extract(entries: &[(Entry, &[u8])], outdir: &Path, force: bool) -> Result
 pub(crate) fn finish_file_meta(dest: &Path, e: &Entry) {
     set_mtime(dest, e.mtime);
     #[cfg(unix)]
-    if e.perms() != 0 {
+    if e.perms() & 0o777 != 0 {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(dest, fs::Permissions::from_mode(e.perms()));
+        // setuid / setgid / sticky bits are never restored: an archive from someone else
+        // must not be able to create a setuid-root program when extracted by root
+        let _ = fs::set_permissions(dest, fs::Permissions::from_mode(e.perms() & 0o777));
     }
 }
 
@@ -916,6 +947,32 @@ mod tests {
         let d = tmp("evil");
         assert!(extract(&entries, &d, false).is_err());
         assert!(!d.join("evil").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn windows_names_are_screened() {
+        for bad in ["CON", "con", "NUL.txt", "aux.tar.gz", "COM1", "lpt9", "CONIN$", "a:b", "C:", "x?", "a*b",
+                    "q\"", "p|q", "a<b", "name.", "name ", "tab\tname", "NUL ."] {
+            assert!(windows_name_unsafe(bad), "{:?} should be refused", bad);
+        }
+        for ok in ["file.txt", "CONSOLE", "COM", "COM0", "COM10", "LPT", "console.log", "a b", ".hidden", "nul_x", "aux1"] {
+            assert!(!windows_name_unsafe(ok), "{:?} should be fine", ok);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setuid_bits_are_not_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("setuid");
+        let entries = vec![(
+            Entry { name: "prog".into(), size: 3, mode: 0o6755, mtime: 0, crc: 0, offset: 0 },
+            &b"abc"[..],
+        )];
+        extract(&entries, &d, false).unwrap();
+        let mode = fs::metadata(d.join("prog")).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755, "setuid/setgid must be dropped");
         let _ = fs::remove_dir_all(&d);
     }
 }

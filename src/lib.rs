@@ -36,7 +36,7 @@ use std::time::Duration;
 pub const MAGIC_V1: &[u8; 4] = b"DLB1";
 pub const MAGIC: &[u8; 4] = b"DLB2";
 /// Release name (shown by `dlb -V` and in the app); the number is `CARGO_PKG_VERSION`.
-pub const CODENAME: &str = "Turbo Button";
+pub const CODENAME: &str = "Dial-up Dragon";
 /// Context-mixing model used by this build, stored in byte 4 of a `DLB2` header. A future model
 /// gets the next number and old archives keep decoding with the old one; a reader that does not
 /// know the number refuses the archive instead of producing garbage.
@@ -338,7 +338,7 @@ fn parse_blocks(blob: &[u8]) -> Result<(usize, u32, Vec<BlockInfo<'_>>), String>
         return Err("not a DLB file (bad magic)".into());
     }
     let corrupt = |m: &str| Err(format!("corrupt header: {}", m));
-    let check_nbits = |n: u32| (10..=30).contains(&(n & 0x7F));
+    let check_nbits = |n: u32| (10..=27).contains(&(n & 0x7F));
 
     if &blob[0..4] == MAGIC_V1 {
         if blob.len() < V1_HEADER {
@@ -476,6 +476,7 @@ pub fn decompress_ranges(
         start = end;
     }
     let mut out = vec![0u8; total];
+    let corrupt = AtomicBool::new(false);
     {
         let mut slots: Vec<Mutex<&mut [u8]>> = Vec::with_capacity(blocks.len());
         let mut rest: &mut [u8] = &mut out;
@@ -495,15 +496,27 @@ pub fn decompress_ranges(
                 dst[..n].copy_from_slice(&b.body[..n]);
                 prog(n);
                 Some(())
-            } else if cm::cm_decompress(b.body, &mut dst[..n], b.nbits, prog) {
-                Some(())
             } else {
-                None
+                match cm::cm_decompress(b.body, &mut dst[..n], b.nbits, prog) {
+                    Ok(()) => Some(()),
+                    Err(e) => {
+                        corrupt.store(e == cm::DecodeError::Corrupt, SeqCst);
+                        None
+                    }
+                }
             }
         };
-        run_blocks(&need, threads, &work, progress).ok_or_else(|| "cancelled".to_string())?;
+        run_blocks(&need, threads, &work, progress).ok_or_else(|| failure(&corrupt))?;
     }
     Ok(out)
+}
+
+fn failure(corrupt: &AtomicBool) -> String {
+    if corrupt.load(SeqCst) {
+        cm::ERR_CORRUPT_STREAM.to_string()
+    } else {
+        "cancelled".to_string()
+    }
 }
 
 /// Extracts only the entries whose index is in `select` (indices into [`list_entries`]).
@@ -538,6 +551,7 @@ pub fn decompress_payload(
 ) -> Result<Vec<u8>, String> {
     let (total, crc, blocks) = parse_blocks(blob)?;
     let mut out = vec![0u8; total];
+    let corrupt = AtomicBool::new(false);
     {
         // hand every block its own disjoint slice of the output
         let mut slots: Vec<Mutex<&mut [u8]>> = Vec::with_capacity(blocks.len());
@@ -555,13 +569,17 @@ pub fn decompress_payload(
                 dst.copy_from_slice(b.body);
                 prog(b.raw);
                 Some(())
-            } else if cm::cm_decompress(b.body, &mut dst, b.nbits, prog) {
-                Some(())
             } else {
-                None
+                match cm::cm_decompress(b.body, &mut dst, b.nbits, prog) {
+                    Ok(()) => Some(()),
+                    Err(e) => {
+                        corrupt.store(e == cm::DecodeError::Corrupt, SeqCst);
+                        None
+                    }
+                }
             }
         };
-        run_blocks(&sizes, threads, &work, progress).ok_or_else(|| "cancelled".to_string())?;
+        run_blocks(&sizes, threads, &work, progress).ok_or_else(|| failure(&corrupt))?;
     }
     if crc32::crc32(&out) != crc {
         return Err("CRC mismatch: data is corrupt".into());

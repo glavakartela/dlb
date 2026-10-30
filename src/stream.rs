@@ -194,7 +194,7 @@ pub struct Container {
 /// Reads and validates the block table (`DLB1` and `DLB2`).
 pub fn read_container(src: &dyn Source) -> Result<Container, String> {
     let corrupt = |m: &str| Err(format!("corrupt header: {}", m));
-    let check_nbits = |n: u32| (10..=30).contains(&(n & 0x7F));
+    let check_nbits = |n: u32| (10..=27).contains(&(n & 0x7F));
     let mut magic = [0u8; 4];
     if src.len() < 4 {
         return Err("not a DLB file (bad magic)".into());
@@ -304,11 +304,8 @@ fn decode_block(
     let mut comp = vec![0u8; b.comp];
     src.read_at(b.off, &mut comp)?;
     let mut out = vec![0u8; n];
-    if cm::cm_decompress(&comp, &mut out, b.nbits, prog) {
-        Ok(out)
-    } else {
-        Err("cancelled".into())
-    }
+    cm::cm_decompress(&comp, &mut out, b.nbits, prog).map_err(|e| e.message())?;
+    Ok(out)
 }
 
 /// The first `want` bytes of the payload (fewer if it is shorter). Block 0 is decoded from a
@@ -447,11 +444,15 @@ fn pipeline<T: Send>(
                 };
                 let Some(i) = i else { break };
                 let mut last = 0usize;
-                let r = produce(i, &mut |d| {
-                    done.fetch_add(d.saturating_sub(last), SeqCst);
-                    last = last.max(d);
-                    !stop.load(SeqCst)
-                });
+                // a panic in a worker must not leave the consumer waiting for its block forever
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    produce(i, &mut |d| {
+                        done.fetch_add(d.saturating_sub(last), SeqCst);
+                        last = last.max(d);
+                        !stop.load(SeqCst)
+                    })
+                }))
+                .unwrap_or_else(|_| Err("internal error: worker thread panicked".to_string()));
                 let mut g = m.lock().unwrap();
                 if r.is_err() {
                     halt(&mut g);
@@ -460,6 +461,22 @@ fn pipeline<T: Send>(
                 cv.notify_all();
             });
         }
+
+        // if `consume` or `progress` panics, still release the workers (the scope would
+        // otherwise wait for them forever)
+        struct Release<'a, F: Fn()>(&'a F);
+        impl<F: Fn()> Drop for Release<'_, F> {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+        let release = || {
+            let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+            g.stop = true;
+            stop.store(true, SeqCst);
+            cv.notify_all();
+        };
+        let _release = Release(&release);
 
         'outer: for i in 0..n {
             let item = loop {
@@ -799,6 +816,9 @@ impl<'a> Extractor<'a> {
             path = d.join(rel);
         }
         if kind == KIND_DIR {
+            if e.size != 0 {
+                return Err("corrupt archive payload".into());
+            }
             if self.dest.is_some() {
                 fs::create_dir_all(&path).map_err(|x| format!("{}: {}", path.display(), x))?;
                 self.files += 1;
@@ -827,7 +847,7 @@ impl<'a> Extractor<'a> {
     }
 
     fn write(&mut self, data: &[u8]) -> Result<(), String> {
-        let st = self.st.as_mut().expect("open entry");
+        let st = self.st.as_mut().ok_or_else(|| "corrupt archive payload".to_string())?;
         st.crc.update(data);
         st.got += data.len() as u64;
         match &mut st.sink {

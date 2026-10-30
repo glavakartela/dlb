@@ -55,7 +55,8 @@ Examples: `dlb c -x .git -x node_modules proj/`, `dlb x backup.dlb 'proj/src' '*
 
 Several files or folders are packed into one *solid* archive (files are grouped by extension),
 which noticeably improves the ratio. Extraction refuses paths that escape the target folder and
-never overwrites without `-f`. File modification times are stored and restored.
+never overwrites without `-f`; it also never restores setuid/setgid bits, and on Windows it refuses
+device names such as `CON` or `NUL`. File modification times are stored and restored.
 
 ## Results (level 7, single thread)
 
@@ -308,6 +309,10 @@ log: a model change that makes things worse shows up as a bigger number.
   built-in dictionary yet
 
 ## Verification status
+
+The reading side is also fuzzed (`tests/fuzz.rs`): thousands of mutated archives (bit flips,
+truncation, forged sizes) must end without a panic or a hang, and every crash found is kept as
+a regression archive in `tests/data`.
 
 `cargo test` covers the streaming path as well: virtual payload equal to the in-memory one,
 round trips with several block sizes, thread counts and passwords, files from the in-memory

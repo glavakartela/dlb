@@ -647,13 +647,36 @@ impl<'a> CmStream<'a> {
     }
 }
 
-/// Decodes exactly `out.len()` bytes into `out`. Returns false if cancelled.
+/// Why a block could not be decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
+    /// the progress callback asked to stop
+    Cancelled,
+    /// the arithmetic decoder ran past the end of its input: the stream is damaged (or the
+    /// header lies about the length). A valid stream is consumed exactly, never beyond.
+    Corrupt,
+}
+
+pub const ERR_CORRUPT_STREAM: &str = "corrupt data: compressed stream ends too early";
+
+impl DecodeError {
+    pub fn message(self) -> String {
+        match self {
+            DecodeError::Cancelled => "cancelled".into(),
+            DecodeError::Corrupt => ERR_CORRUPT_STREAM.into(),
+        }
+    }
+}
+
+/// Decodes exactly `out.len()` bytes into `out`. Stops early with `Corrupt` as soon as the
+/// decoder has read past its input, so a damaged block (or one whose declared length is far too
+/// big) fails in moments instead of decoding garbage for minutes.
 pub fn cm_decompress(
     comp: &[u8],
     out: &mut [u8],
     nbits: u32,
     progress: &mut dyn FnMut(usize) -> bool,
-) -> bool {
+) -> Result<(), DecodeError> {
     let len = out.len();
     let mut pred = Predictor::new(nbits);
     let mut dec = Decoder::new(comp);
@@ -666,10 +689,15 @@ pub fn cm_decompress(
         }
         out[i] = c as u8;
         pred.end_byte(&out[..=i]);
-        if i & 0xFFFF == 0 && !progress(i) {
-            return false;
+        if i & 0xFFF == 0 {
+            if dec.pos > comp.len() + 8 {
+                return Err(DecodeError::Corrupt);
+            }
+            if i & 0xFFFF == 0 && !progress(i) {
+                return Err(DecodeError::Cancelled);
+            }
         }
     }
     progress(len);
-    true
+    Ok(())
 }
