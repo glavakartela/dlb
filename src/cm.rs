@@ -14,7 +14,8 @@
 const NCTX_BASE: usize = 12;
 const NCTX_MAX: usize = 20; // "ultra" model adds 6 contexts, model v1 two more
 const NM: usize = 2;
-const NIN_MAX: usize = NCTX_MAX * 2 + NM * 2 + 1;
+const NIN_MAX: usize = 48; // >= NCTX_MAX*2+NM*2+1, a multiple of 8 and of the 16 inputs a SIMD group writes
+const NLANE: usize = 24; // contexts padded to whole groups of 8
 const NSEL_BASE: usize = 3;
 const NSEL_MAX: usize = 5; // "ultra" adds a 4th mixer selector, model v1 one more
 
@@ -254,16 +255,43 @@ fn train_generic(w: &mut [i32], x: &[i32], err: i32) {
     }
 }
 
+/// `w.len() == x.len()`, a multiple of 8. Exact: signed 32x32 -> 64-bit products.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_avx2(w: &[i32], x: &[i32]) -> i64 {
-    dot_generic(w, x)
+    use std::arch::x86_64::*;
+    debug_assert!(w.len() == x.len() && w.len() % 8 == 0);
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i + 8 <= w.len() {
+        let wv = _mm256_loadu_si256(w.as_ptr().add(i) as *const __m256i);
+        let xv = _mm256_loadu_si256(x.as_ptr().add(i) as *const __m256i);
+        let even = _mm256_mul_epi32(wv, xv);
+        let odd = _mm256_mul_epi32(_mm256_srli_epi64::<32>(wv), _mm256_srli_epi64::<32>(xv));
+        acc = _mm256_add_epi64(acc, _mm256_add_epi64(even, odd));
+        i += 8;
+    }
+    let mut out = [0i64; 4];
+    _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, acc);
+    out[0].wrapping_add(out[1]).wrapping_add(out[2]).wrapping_add(out[3])
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn train_avx2(w: &mut [i32], x: &[i32], err: i32) {
-    train_generic(w, x, err)
+    use std::arch::x86_64::*;
+    debug_assert!(w.len() == x.len() && w.len() % 8 == 0);
+    let errv = _mm256_set1_epi32(err);
+    let rnd = _mm256_set1_epi32(0x2000);
+    let mut i = 0;
+    while i + 8 <= w.len() {
+        let wp = w.as_mut_ptr().add(i) as *mut __m256i;
+        let wv = _mm256_loadu_si256(wp as *const __m256i);
+        let xv = _mm256_loadu_si256(x.as_ptr().add(i) as *const __m256i);
+        let d = _mm256_srai_epi32::<14>(_mm256_add_epi32(_mm256_mullo_epi32(xv, errv), rnd));
+        _mm256_storeu_si256(wp, _mm256_add_epi32(wv, d));
+        i += 8;
+    }
 }
 
 #[inline]
@@ -291,7 +319,7 @@ fn train(avx2: bool, w: &mut [i32], x: &[i32], err: i32) {
 fn detect_avx2() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        std::arch::is_x86_feature_detected!("avx2")
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("bmi2")
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -299,6 +327,7 @@ fn detect_avx2() -> bool {
     }
 }
 
+#[allow(dead_code)] // the SIMD-only fields are unused on other architectures
 pub struct Predictor {
     nbits: u32,
     nctx: usize,
@@ -320,8 +349,15 @@ pub struct Predictor {
     pword: u32,
     ctxh: [u32; NCTX_MAX],
     idx: [usize; NCTX_MAX],
-    base: [usize; NCTX_MAX],
-    chk: [u32; NCTX_MAX],
+    base: [i32; NLANE],
+    chk: [u32; NLANE],
+    idx32: [i32; NLANE],
+    sv: [u32; NLANE],
+    vec_ok: bool,
+    vec_used: bool,
+    toff: usize,
+    nstride: usize,
+    stretch32: Vec<i32>,
     x: [i32; NIN_MAX],
     mm: [MatchModel; NM],
     w1: Vec<Vec<i32>>,
@@ -340,6 +376,11 @@ pub struct Predictor {
 impl Predictor {
     /// `nbits_byte`: log2 of table slots, with `ULTRA_FLAG` for the ultra model.
     pub fn new(nbits_byte: u32) -> Self {
+        Self::with_simd(nbits_byte, true)
+    }
+
+    /// `simd = false` forces the portable code path (used by tests to prove both agree).
+    pub fn with_simd(nbits_byte: u32, simd: bool) -> Self {
         let ultra = nbits_byte & ULTRA_FLAG != 0;
         let v1 = ((nbits_byte >> 8) & 0xFF) >= 1;
         let nbits = nbits_byte & 0x7F;
@@ -352,16 +393,17 @@ impl Predictor {
         for (n, c) in conf.iter_mut().enumerate() {
             *c = ((n as i32) * 32).min(256);
         }
+        let ns = (nin + 7) & !7; // weight rows are padded to whole SIMD vectors
         let mut w1 = vec![
-            vec![10000i32; 256 * nin],
-            vec![10000i32; 256 * nin],
-            vec![10000i32; 64 * nin],
+            vec![10000i32; 256 * ns],
+            vec![10000i32; 256 * ns],
+            vec![10000i32; 64 * ns],
         ];
         if ultra {
-            w1.push(vec![10000i32; 256 * nin]);
+            w1.push(vec![10000i32; 256 * ns]);
         }
         if v1 {
-            w1.push(vec![10000i32; 256 * nin]);
+            w1.push(vec![10000i32; 256 * ns]);
         }
         let mut p = Predictor {
             nbits,
@@ -371,8 +413,8 @@ impl Predictor {
             nsel,
             ultra,
             v1,
-            avx2: detect_avx2(),
-            t: vec![0u32; 1usize << nbits],
+            avx2: simd && detect_avx2(),
+            t: vec![0u32; (1usize << nbits) + 16],
             stretch: build_stretch(),
             rt: build_rt(),
             conf,
@@ -384,8 +426,15 @@ impl Predictor {
             pword: 0,
             ctxh: [0; NCTX_MAX],
             idx: [0; NCTX_MAX],
-            base: [0; NCTX_MAX],
-            chk: [0; NCTX_MAX],
+            base: [0; NLANE],
+            chk: [0; NLANE],
+            idx32: [0; NLANE],
+            sv: [0; NLANE],
+            vec_ok: false,
+            vec_used: false,
+            toff: 0,
+            nstride: (nin + 7) & !7,
+            stretch32: Vec::new(),
             x: [0; NIN_MAX],
             mm: [MatchModel::new(20, hbits), MatchModel::new(6, hbits)],
             w1,
@@ -400,12 +449,215 @@ impl Predictor {
             a3: Apm::new(65536),
             pr: 32768,
         };
+        p.toff = (p.t.as_ptr().align_offset(64)).min(15);
+        p.stretch32 = p.stretch.iter().map(|&v| v as i32).collect();
         p.byte_update_contexts();
         if ultra {
             p.ultra_contexts(&[]);
         }
+        p.set_bases();
         p.predict();
         p
+    }
+
+    fn predict(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        if self.avx2 {
+            // SAFETY: `avx2` is only set when the CPU reports AVX2 and BMI2.
+            return unsafe { self.predict_avx2() };
+        }
+        self.predict_impl()
+    }
+
+    pub fn update(&mut self, y: u32) {
+        #[cfg(target_arch = "x86_64")]
+        if self.avx2 {
+            // SAFETY: as above.
+            return unsafe { self.update_avx2(y) };
+        }
+        self.update_impl(y)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn predict_avx2(&mut self) {
+        self.predict_impl()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn update_avx2(&mut self, y: u32) {
+        self.update_impl(y)
+    }
+
+
+    /// Bucket addresses for the next nibble (one 64-byte line per context), prefetched so the
+    /// memory latency overlaps with the rest of the update.
+    fn set_bases(&mut self) {
+        let cm = if self.bitpos == 4 { self.c0.wrapping_mul(0x9E37_79B1) } else { 0 };
+        let shift = 32 - (self.nbits - 4);
+        let toff = self.toff as i32;
+        for i in 0..self.nctx {
+            let mut k = (self.ctxh[i] ^ cm).wrapping_mul(0x85EB_CA6B);
+            k ^= k >> 16;
+            self.base[i] = (((k >> shift) as usize) << 4) as i32 + toff;
+            self.chk[i] = k & 0xFF;
+        }
+        // Two contexts in the same bucket would see each other's updates within a bit; the
+        // SIMD path reads all slots first, so such nibbles take the sequential path.
+        let mut dup = false;
+        for i in 1..self.nctx {
+            for j in 0..i {
+                dup |= self.base[i] == self.base[j];
+            }
+        }
+        self.vec_ok = self.avx2 && !dup;
+        #[cfg(target_arch = "x86_64")]
+        for i in 0..self.nctx {
+            // SAFETY: the address is inside `t` (base < len) and prefetch never faults.
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                    self.t.as_ptr().add(self.base[i] as usize) as *const i8,
+                );
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn counters_predict(&mut self, nib: usize) -> usize {
+        // the flag is for the bucket set in use now; `set_bases` may already have computed the next
+        self.vec_used = self.vec_ok;
+        #[cfg(target_arch = "x86_64")]
+        if self.vec_used {
+            // SAFETY: `vec_ok` implies AVX2 was detected.
+            return unsafe { self.counters_predict_avx2(nib) };
+        }
+        let mut hits = 0usize;
+        for i in 0..self.nctx {
+            let idx = self.base[i] as usize + nib;
+            let chk = self.chk[i];
+            let mut s = self.t[idx];
+            if (s >> 24) != chk {
+                s = (chk << 24) | (1 << 17);
+                self.t[idx] = s;
+            }
+            self.idx[i] = idx;
+            let n = ((s >> 18) & 63) as usize;
+            hits += (n != 0) as usize;
+            let p12 = ((s & 0x3FFFF) >> 6) as i32;
+            self.x[2 * i] = self.stretch[p12 as usize] as i32;
+            self.x[2 * i + 1] = if n == 0 { 0 } else { ((p12 - 2048) * self.conf[n]) >> 8 };
+        }
+        hits
+    }
+
+    #[inline(always)]
+    fn counters_update(&mut self, y: u32) {
+        #[cfg(target_arch = "x86_64")]
+        if self.vec_used {
+            // SAFETY: `vec_ok` implies AVX2 was detected.
+            return unsafe { self.counters_update_avx2(y) };
+        }
+        for i in 0..self.nctx {
+            let s = self.t[self.idx[i]];
+            let n = (s >> 18) & 63;
+            let p = (s & 0x3FFFF) as i32;
+            let target: i32 = if y == 1 { 0x3FFFF } else { 0 };
+            let delta = (((target - p) >> 3) * self.rt[n as usize]) >> 13;
+            let np = (p + delta) as u32;
+            let nn = if n < 10 { n + 1 } else { n };
+            self.t[self.idx[i]] = (s & 0xFF00_0000) | (nn << 18) | (np & 0x3FFFF);
+        }
+    }
+
+    /// Same arithmetic as the scalar loop, eight contexts at a time. Slots are gathered, so it
+    /// is only used when no two contexts share a bucket (`vec_ok`).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn counters_predict_avx2(&mut self, nib: usize) -> usize {
+        use std::arch::x86_64::*;
+        let nctx = self.nctx;
+        let groups = (nctx + 7) / 8;
+        let nibv = _mm256_set1_epi32(nib as i32);
+        let c63 = _mm256_set1_epi32(63);
+        let c2048 = _mm256_set1_epi32(2048);
+        let c256 = _mm256_set1_epi32(256);
+        let m18 = _mm256_set1_epi32(0x3FFFF);
+        let init = _mm256_set1_epi32(1 << 17);
+        let iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let tptr = self.t.as_mut_ptr();
+        let mut hits = 0usize;
+        for g in 0..groups {
+            let l0 = g * 8;
+            let valid = _mm256_cmpgt_epi32(_mm256_set1_epi32(nctx as i32), _mm256_add_epi32(iota, _mm256_set1_epi32(l0 as i32)));
+            let basev = _mm256_loadu_si256(self.base.as_ptr().add(l0) as *const __m256i);
+            let idxv = _mm256_add_epi32(basev, nibv);
+            _mm256_storeu_si256(self.idx32.as_mut_ptr().add(l0) as *mut __m256i, idxv);
+            let mut s = _mm256_i32gather_epi32::<4>(tptr as *const i32, idxv);
+            let chkv = _mm256_loadu_si256(self.chk.as_ptr().add(l0) as *const __m256i);
+            let eq = _mm256_cmpeq_epi32(_mm256_srli_epi32::<24>(s), chkv);
+            let reset = _mm256_andnot_si256(eq, valid);
+            let newv = _mm256_or_si256(_mm256_slli_epi32::<24>(chkv), init);
+            s = _mm256_blendv_epi8(s, newv, reset);
+            let mut m = _mm256_movemask_ps(_mm256_castsi256_ps(reset)) as u32;
+            while m != 0 {
+                let l = m.trailing_zeros() as usize;
+                m &= m - 1;
+                *tptr.add(self.idx32[l0 + l] as usize) = (self.chk[l0 + l] << 24) | (1 << 17);
+            }
+            _mm256_storeu_si256(self.sv.as_mut_ptr().add(l0) as *mut __m256i, s);
+            let n = _mm256_and_si256(_mm256_srli_epi32::<18>(s), c63);
+            let p12 = _mm256_srli_epi32::<6>(_mm256_and_si256(s, m18));
+            let st = _mm256_i32gather_epi32::<4>(self.stretch32.as_ptr(), p12);
+            let conf = _mm256_min_epi32(_mm256_slli_epi32::<5>(n), c256);
+            let xb = _mm256_srai_epi32::<8>(_mm256_mullo_epi32(_mm256_sub_epi32(p12, c2048), conf));
+            let st = _mm256_and_si256(st, valid);
+            let xb = _mm256_and_si256(xb, valid);
+            let nz = _mm256_andnot_si256(_mm256_cmpeq_epi32(n, _mm256_setzero_si256()), valid);
+            hits += (_mm256_movemask_ps(_mm256_castsi256_ps(nz)) as u32).count_ones() as usize;
+            let lo = _mm256_unpacklo_epi32(st, xb);
+            let hi = _mm256_unpackhi_epi32(st, xb);
+            let o = self.x.as_mut_ptr().add(2 * l0);
+            _mm256_storeu_si256(o as *mut __m256i, _mm256_permute2x128_si256::<0x20>(lo, hi));
+            _mm256_storeu_si256(o.add(8) as *mut __m256i, _mm256_permute2x128_si256::<0x31>(lo, hi));
+        }
+        hits
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn counters_update_avx2(&mut self, y: u32) {
+        use std::arch::x86_64::*;
+        let nctx = self.nctx;
+        let groups = (nctx + 7) / 8;
+        let target = _mm256_set1_epi32(if y == 1 { 0x3FFFF } else { 0 });
+        let c63 = _mm256_set1_epi32(63);
+        let m18 = _mm256_set1_epi32(0x3FFFF);
+        let top = _mm256_set1_epi32(0xFF00_0000u32 as i32);
+        let ten = _mm256_set1_epi32(10);
+        let one = _mm256_set1_epi32(1);
+        let tptr = self.t.as_mut_ptr();
+        for g in 0..groups {
+            let l0 = g * 8;
+            let s = _mm256_loadu_si256(self.sv.as_ptr().add(l0) as *const __m256i);
+            let n = _mm256_and_si256(_mm256_srli_epi32::<18>(s), c63);
+            let p = _mm256_and_si256(s, m18);
+            let d = _mm256_srai_epi32::<3>(_mm256_sub_epi32(target, p));
+            let r = _mm256_i32gather_epi32::<4>(self.rt.as_ptr(), n);
+            let delta = _mm256_srai_epi32::<13>(_mm256_mullo_epi32(d, r));
+            let np = _mm256_add_epi32(p, delta);
+            let nn = _mm256_add_epi32(n, _mm256_and_si256(_mm256_cmpgt_epi32(ten, n), one));
+            let ns = _mm256_or_si256(
+                _mm256_or_si256(_mm256_and_si256(s, top), _mm256_slli_epi32::<18>(nn)),
+                _mm256_and_si256(np, m18),
+            );
+            let mut tmp = [0u32; 8];
+            _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, ns);
+            let cnt = (nctx - l0).min(8);
+            for l in 0..cnt {
+                *tptr.add(self.idx32[l0 + l] as usize) = tmp[l];
+            }
+        }
     }
 
     #[inline]
@@ -456,40 +708,15 @@ impl Predictor {
         self.ctxh[o + 5] = hc(17, self.word ^ (self.c4 & 0xFFFF).wrapping_mul(0x9E37_79B1));
     }
 
-    fn predict(&mut self) {
+    #[inline(always)]
+    fn predict_impl(&mut self) {
         let c0 = self.c0;
-        if self.bitpos == 0 || self.bitpos == 4 {
-            // one 64-byte cache line (16 slots) per context per nibble
-            let cm = if self.bitpos == 4 { c0.wrapping_mul(0x9E37_79B1) } else { 0 };
-            let shift = 32 - (self.nbits - 4);
-            for i in 0..self.nctx {
-                let mut k = (self.ctxh[i] ^ cm).wrapping_mul(0x85EB_CA6B);
-                k ^= k >> 16;
-                self.base[i] = ((k >> shift) as usize) << 4;
-                self.chk[i] = k & 0xFF;
-            }
-        }
         let nib = if self.bitpos < 4 {
             c0 as usize
         } else {
             ((c0 & ((1 << (self.bitpos - 4)) - 1)) | (1 << (self.bitpos - 4))) as usize
         };
-        let mut hits = 0usize;
-        for i in 0..self.nctx {
-            let idx = self.base[i] + nib;
-            let chk = self.chk[i];
-            let mut s = self.t[idx];
-            if (s >> 24) != chk {
-                s = (chk << 24) | (1 << 17);
-                self.t[idx] = s;
-            }
-            self.idx[i] = idx;
-            let n = ((s >> 18) & 63) as usize;
-            hits += (n != 0) as usize;
-            let p12 = ((s & 0x3FFFF) >> 6) as i32;
-            self.x[2 * i] = self.stretch[p12 as usize] as i32;
-            self.x[2 * i + 1] = if n == 0 { 0 } else { ((p12 - 2048) * self.conf[n]) >> 8 };
-        }
+        let hits = self.counters_predict(nib);
         let base = self.nctx * 2;
         for m in 0..NM {
             let mut tmp = [0i32; 2];
@@ -498,6 +725,7 @@ impl Predictor {
             self.x[base + m * 2 + 1] = tmp[1];
         }
         let nin = self.nin;
+        let ns = self.nstride;
         self.x[nin - 1] = 256;
 
         let q = self.mm[0].level().max(self.mm[1].level());
@@ -515,9 +743,9 @@ impl Predictor {
         let mut dot2: i64 = 0;
         self.sel2 = c0 as usize;
         for k in 0..nsel {
-            let off = self.sel[k] * nin;
-            let w = &self.w1[k][off..off + nin];
-            let dot = dot(self.avx2, w, &self.x[..nin]);
+            let off = self.sel[k] * ns;
+            let w = &self.w1[k][off..off + ns];
+            let dot = dot(self.avx2, w, &self.x[..ns]);
             let st = ((dot >> 16) as i32).clamp(-2047, 2047);
             self.st1[k] = st;
             self.p1[k] = squash(st);
@@ -538,30 +766,31 @@ impl Predictor {
         self.pr = p.clamp(1, 65535);
     }
 
-    pub fn update(&mut self, y: u32) {
-        // counters
-        for i in 0..self.nctx {
-            let s = self.t[self.idx[i]];
-            let n = (s >> 18) & 63;
-            let p = (s & 0x3FFFF) as i32;
-            let target: i32 = if y == 1 { 0x3FFFF } else { 0 };
-            let delta = (((target - p) >> 3) * self.rt[n as usize]) >> 13;
-            let np = (p + delta) as u32;
-            let nn = if n < 10 { n + 1 } else { n };
-            self.t[self.idx[i]] = (s & 0xFF00_0000) | (nn << 18) | (np & 0x3FFFF);
+    #[inline(always)]
+    fn update_impl(&mut self, y: u32) {
+        // the next nibble's buckets are known now: start fetching them first
+        let c0n = (self.c0 << 1) | y;
+        if self.bitpos == 3 {
+            self.c0 = c0n;
+            self.bitpos = 4;
+            self.set_bases();
+            self.bitpos = 3;
+            self.c0 = c0n >> 1;
         }
+        // counters
+        self.counters_update(y);
         for m in 0..NM {
             self.mm[m].update_bit(y, &self.rt);
         }
         // mixers
         let ybit = (y << 12) as i32;
-        let (nin, nsel) = (self.nin, self.nsel);
+        let (ns, nsel) = (self.nstride, self.nsel);
         let lr1 = if self.v1 { 3 } else { LR1 };
         for k in 0..nsel {
             let err = (ybit - self.p1[k]) * lr1;
-            let off = self.sel[k] * nin;
-            let w = &mut self.w1[k][off..off + nin];
-            train(self.avx2, w, &self.x[..nin], err);
+            let off = self.sel[k] * ns;
+            let w = &mut self.w1[k][off..off + ns];
+            train(self.avx2, w, &self.x[..ns], err);
         }
         let err2 = (ybit - self.pm) * LR2;
         for k in 0..nsel {
@@ -600,12 +829,13 @@ impl Predictor {
     /// Completes a byte: `hist` is everything coded so far, ending with the byte
     /// just finished. The caller owns the history, so no copy is kept here.
     pub fn end_byte(&mut self, hist: &[u8]) {
-        for m in 0..NM {
-            self.mm[m].update_byte(hist);
-        }
         self.byte_update_contexts();
         if self.ultra {
             self.ultra_contexts(hist);
+        }
+        self.set_bases();
+        for m in 0..NM {
+            self.mm[m].update_byte(hist);
         }
         self.predict();
     }
@@ -797,4 +1027,62 @@ pub fn cm_decompress(
     }
     progress(len);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(n: usize) -> Vec<u8> {
+        let mut x = 0x9E37_79B9u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let words = ["alpha", "beta", "gamma", "delta", "mixing", "context", "stream"];
+        let mut v = Vec::new();
+        while v.len() < n {
+            let r = next();
+            match r % 5 {
+                0 | 1 => {
+                    v.extend_from_slice(words[(r >> 8) as usize % words.len()].as_bytes());
+                    v.push(b' ');
+                }
+                2 => v.extend_from_slice(&[0xE8, (r >> 8) as u8, 0, 0, 0]),
+                3 => v.extend_from_slice(&r.to_le_bytes()),
+                _ => {
+                    let from = v.len().saturating_sub(300 + (r >> 8) as usize % 700);
+                    let to = (from + 40).min(v.len());
+                    let chunk: Vec<u8> = v[from..to].to_vec();
+                    v.extend_from_slice(&chunk);
+                }
+            }
+        }
+        v.truncate(n);
+        v
+    }
+
+    /// The SIMD and the portable predictor must agree on every probability, including when
+    /// contexts collide in a tiny table, for every model flavour.
+    #[test]
+    fn simd_and_portable_paths_agree() {
+        let data = sample(24_000);
+        for &(nb, ver) in &[(16u32, 1u8), (12 + 4, 0), (18, 1), (22, 1), (16 | ULTRA_FLAG, 1), (20 | ULTRA_FLAG, 0), (17 | ULTRA_FLAG, 1)] {
+            let arg = nb | ver_bits(ver);
+            let mut a = Predictor::with_simd(arg, true);
+            let mut b = Predictor::with_simd(arg, false);
+            for (i, &byte) in data.iter().enumerate() {
+                for j in (0..8).rev() {
+                    let y = ((byte >> j) & 1) as u32;
+                    assert_eq!(a.p(), b.p(), "nbits {:#x} v{} byte {} bit {}", nb, ver, i, j);
+                    a.update(y);
+                    b.update(y);
+                }
+                a.end_byte(&data[..=i]);
+                b.end_byte(&data[..=i]);
+            }
+        }
+    }
 }

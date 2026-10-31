@@ -5,6 +5,17 @@ Commit messages are in English: a short summary line (`feat:`, `fix:`, `perf:`, 
 `test:`, `ci:`), then a paragraph on what changed and why. Entries here are grouped as
 Added / Changed / Fixed.
 
+## 0.16.1 "Floppy Phoenix"
+
+### Changed
+- **About 1.5x faster compression and decompression** (model v1, same bytes out: archives are
+  bit-identical to 0.16.0). The 14 context counters are updated eight at a time with AVX2
+  (checked at run time; other CPUs and architectures use the portable code, and a test proves
+  both give identical probabilities, including when contexts collide in a tiny table). The
+  table buckets are now cache-line aligned and prefetched as soon as the next nibble's address
+  is known, so memory latency overlaps with the rest of the update.
+- Mixer weight rows are padded to whole SIMD vectors (zero inputs, so results are unchanged).
+
 ## 0.16.0 "Floppy Phoenix"
 
 ### Added
