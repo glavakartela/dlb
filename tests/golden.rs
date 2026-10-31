@@ -45,9 +45,9 @@ fn hex(b: &[u8]) -> String {
 
 /// (level, expected size, expected SHA-256 of the whole .dlb output)
 const GOLDEN: &[(u32, usize, &str)] = &[
-    (1, 32829, "987af58cfc7cf24a497336054997969246293967e1b1dcaa5434a5f11ef064ad"),
-    (5, 30235, "67467290e665bed3fa8b32b03b902ed91f9ada64c445e21788b0c4e39970a85f"),
-    (10, 29112, "50749c969482b0ce271f78353a6ffc42bba070799fc05a25659d9b8b930dadab"),
+    (1, 30618, "dcf46b3ef04529e891847c816e8dcf6bada13c1950efaddfb8e3231f8e1bb2f0"),
+    (5, 29149, "1d79c184c68023049132f5ee85b5dcde5e7d7398915c524478fcf3daaf2800e1"),
+    (10, 28826, "ad115ddeaa5b60a5289f7dbfa2d17c0c1ac77768c2b1dd63c9aba98ed72fe157"),
 ];
 
 #[test]
@@ -64,4 +64,23 @@ fn output_is_identical_on_every_platform() {
         }
     }
     assert!(bad.is_empty(), "bitstream changed at levels {:?}", bad);
+}
+
+/// Writes the corpus to the file named by DLB_DUMP (used once to build the model-v0 fixture).
+#[test]
+#[ignore]
+fn dump_corpus() {
+    if let Ok(p) = std::env::var("DLB_DUMP") {
+        std::fs::write(p, corpus()).unwrap();
+    }
+}
+
+/// Archives written by model v0 (releases up to 0.15) must stay readable forever.
+#[test]
+fn model_v0_archives_still_decode() {
+    let blob = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/model-v0.dlb")).unwrap();
+    assert_eq!(blob[4], 0, "fixture must be a model-v0 archive");
+    let payload = decompress_payload(&blob, 1, &mut |_| true).unwrap();
+    let data = corpus();
+    assert!(payload.ends_with(&data), "decoded payload differs from the original file");
 }

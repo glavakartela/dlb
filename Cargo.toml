@@ -1,6 +1,6 @@
 [package]
 name = "dlb"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 description = "DLB: context-mixing file compressor with its own .dlb format"
 

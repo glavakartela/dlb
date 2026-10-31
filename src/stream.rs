@@ -261,7 +261,7 @@ pub fn read_container(src: &dyn Source) -> Result<Container, String> {
         let raw = u32::from_le_bytes(e[0..4].try_into().unwrap()) as usize;
         let comp = u32::from_le_bytes(e[4..8].try_into().unwrap()) as usize;
         let stored = e[8] & 1 != 0;
-        let nbits = e[9] as u32;
+        let nbits = e[9] as u32 | cm::ver_bits(h[4]);
         if pos.checked_add(comp as u64).map_or(true, |end| end > src.len()) {
             return Err("truncated file".into());
         }
@@ -697,7 +697,7 @@ fn compress_inner(
             return Ok(Blk { stored: true, nbits: 0, body: raw, raw: want, crc });
         }
         let nb = (level_to_nbits(level, want) | if level >= 10 { cm::ULTRA_FLAG } else { 0 }) as u8;
-        match cm::cm_compress(&raw, nb as u32, prog) {
+        match cm::cm_compress(&raw, nb as u32 | cm::ver_bits(MODEL_VERSION), prog) {
             None => Err("cancelled".into()),
             Some(body) if body.len() < want => {
                 Ok(Blk { stored: false, nbits: nb, body, raw: want, crc })

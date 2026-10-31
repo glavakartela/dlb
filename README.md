@@ -80,7 +80,7 @@ this program. Typical text and source code compress x4 to x9, executables x3 to 
 
 ### Level 10: Ultra
 
-`dlb c -l 10` uses an extended model: 18 contexts instead of 12 (orders 10, 12, 16 and 24, a
+`dlb c -l 10` uses an extended model: 18 contexts instead of 12 (20 vs 14 in model v1; orders 10, 12, 16 and 24, a
 record-stride context, a word + order-2 context), a fourth mixer selector, and a table twice as
 large (about 550 MB). It is the strongest the program can do and is meant for a single stream
 (the CLI defaults to `-t 1` at this level; the app uses one thread). Measured on 1 MB samples,
@@ -264,7 +264,7 @@ on any other.
 | offset | size | field |
 |---|---|---|
 | 0 | 4 | magic `DLB2` |
-| 4 | 1 | model version (0 = the current model; a reader that does not know the number refuses the archive) |
+| 4 | 1 | model version (0 = releases up to 0.15, 1 = the current model; a reader that does not know the number refuses the archive) |
 | 5 | 1 | reserved (0) |
 | 6 | 8 | payload length |
 | 14 | 4 | CRC-32 of the whole payload |
@@ -282,19 +282,20 @@ are still read.
 ## Determinism test
 
 `tests/golden.rs` compresses a fixed synthetic corpus at levels 1, 5 and 10 and pins the exact
-size and SHA-256 of each result (32829, 30235 and 29112 bytes). Every CI job that runs
+size and SHA-256 of each result (30618, 29149 and 28826 bytes), and decodes a model-v0 archive
+(`tests/data/model-v0.dlb`) to prove old archives stay readable. Every CI job that runs
 `cargo test` therefore checks that the output is bit-identical on that platform, which is the
 guarantee that an archive made on one architecture opens on any other. It doubles as a ratio
 log: a model change that makes things worse shows up as a bigger number.
 
 ## Model
 
-- 12 hashed contexts: orders 0-6 and 8, two word contexts, two sparse contexts; 32-bit slots
+- 14 hashed contexts (model v1; v0 had 12): orders 0-6 and 8, two word contexts, four sparse contexts; 32-bit slots
   (8-bit check, 6-bit count, 18-bit probability) laid out in cache lines (nibble buckets)
 - 2 long-range match models (minimum length 20 and 6)
-- 3 first-layer mixers (selected by partial byte, previous byte, match state) and a
-  second-layer mixer
-- 2 APM/SSE stages and a 32-bit arithmetic coder with 16-bit probabilities
+- 4 first-layer mixers (selected by partial byte, previous byte, match state, number of
+  contexts that have history) and a second-layer mixer
+- 3 APM/SSE stages (v0: 2) and a 32-bit arithmetic coder with 16-bit probabilities
 
 ## Limits
 

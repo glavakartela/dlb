@@ -5,6 +5,22 @@ Commit messages are in English: a short summary line (`feat:`, `fix:`, `perf:`, 
 `test:`, `ci:`), then a paragraph on what changed and why. Entries here are grouped as
 Added / Changed / Fixed.
 
+## 0.16.0 "Floppy Phoenix"
+
+### Added
+- **Model v1** (stored in the container header, byte 4). New archives are ~2.4% smaller on
+  mixed data (benchmark: 828,759 -> 808,613 bytes at level 5) thanks to a fourth first-layer
+  mixer selected by how many contexts have seen the current history, two extra contexts
+  (byte pairs 1+4 and 2+5) and a third SSE stage keyed by order 2. Archives from every earlier
+  release (model v0) are still read; `tests/data/model-v0.dlb` guards that.
+
+### Changed
+- The mixer dot product and weight update use AVX2 when the CPU has it (detected at run time;
+  the arithmetic is exact, so output does not depend on the CPU). About 10% faster.
+- Model v1 costs roughly 30% more time than v0 at the same level; lower the level for speed.
+- Older releases (<= 0.15) report "made by a newer version" on v1 archives rather than
+  decoding them wrongly.
+
 ## 0.15.0 "Dial-up Dragon"
 
 ### Added

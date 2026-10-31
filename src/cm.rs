@@ -12,14 +12,21 @@
 //! (x86, x64, arm, arm64; Linux, Windows, Android).
 
 const NCTX_BASE: usize = 12;
-const NCTX_MAX: usize = 18; // "ultra" model adds 6 contexts
+const NCTX_MAX: usize = 20; // "ultra" model adds 6 contexts, model v1 two more
 const NM: usize = 2;
 const NIN_MAX: usize = NCTX_MAX * 2 + NM * 2 + 1;
 const NSEL_BASE: usize = 3;
-const NSEL_MAX: usize = 4; // "ultra" model adds a 4th mixer selector
+const NSEL_MAX: usize = 5; // "ultra" adds a 4th mixer selector, model v1 one more
 
 /// Bit 7 of the stored `nbits` byte marks the ultra model.
 pub const ULTRA_FLAG: u32 = 0x80;
+
+/// The model version travels in bits 8..16 of the `nbits` argument (it is not part of the
+/// stored byte: the container header carries it).
+#[inline]
+pub fn ver_bits(v: u8) -> u32 {
+    (v as u32) << 8
+}
 
 const LR1: i32 = 4;
 const LR2: i32 = 2;
@@ -231,12 +238,76 @@ fn sm_update(e: &mut u32, y: u32, limit: u32, rt: &[i32]) {
     *e = ((np as u32) << 10) | nn;
 }
 
+#[inline(always)]
+fn dot_generic(w: &[i32], x: &[i32]) -> i64 {
+    let mut dot: i64 = 0;
+    for (&wi, &xi) in w.iter().zip(x) {
+        dot += wi as i64 * xi as i64;
+    }
+    dot
+}
+
+#[inline(always)]
+fn train_generic(w: &mut [i32], x: &[i32], err: i32) {
+    for (wi, &xi) in w.iter_mut().zip(x) {
+        *wi = wi.wrapping_add((xi.wrapping_mul(err).wrapping_add(0x2000)) >> 14);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(w: &[i32], x: &[i32]) -> i64 {
+    dot_generic(w, x)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn train_avx2(w: &mut [i32], x: &[i32], err: i32) {
+    train_generic(w, x, err)
+}
+
+#[inline]
+fn dot(avx2: bool, w: &[i32], x: &[i32]) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        // SAFETY: only set when avx2 was detected at runtime.
+        return unsafe { dot_avx2(w, x) };
+    }
+    let _ = avx2;
+    dot_generic(w, x)
+}
+
+#[inline]
+fn train(avx2: bool, w: &mut [i32], x: &[i32], err: i32) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        // SAFETY: only set when avx2 was detected at runtime.
+        return unsafe { train_avx2(w, x, err) };
+    }
+    let _ = avx2;
+    train_generic(w, x, err)
+}
+
+fn detect_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 pub struct Predictor {
     nbits: u32,
     nctx: usize,
+    nbase: usize,
     nin: usize,
     nsel: usize,
     ultra: bool,
+    v1: bool,
+    avx2: bool,
     t: Vec<u32>,
     stretch: Vec<i16>,
     rt: Vec<i32>,
@@ -262,6 +333,7 @@ pub struct Predictor {
     pm: i32,
     a1: Apm,
     a2: Apm,
+    a3: Apm,
     pr: u32,
 }
 
@@ -269,9 +341,11 @@ impl Predictor {
     /// `nbits_byte`: log2 of table slots, with `ULTRA_FLAG` for the ultra model.
     pub fn new(nbits_byte: u32) -> Self {
         let ultra = nbits_byte & ULTRA_FLAG != 0;
+        let v1 = ((nbits_byte >> 8) & 0xFF) >= 1;
         let nbits = nbits_byte & 0x7F;
-        let nctx = if ultra { NCTX_MAX } else { NCTX_BASE };
-        let nsel = if ultra { NSEL_MAX } else { NSEL_BASE };
+        let nbase = NCTX_BASE + 2 * v1 as usize;
+        let nctx = if ultra { nbase + 6 } else { nbase };
+        let nsel = (if ultra { 4 } else { NSEL_BASE }) + v1 as usize;
         let nin = nctx * 2 + NM * 2 + 1;
         let hbits = (nbits.saturating_sub(2)).clamp(16, 22);
         let mut conf = [0i32; 64];
@@ -286,12 +360,18 @@ impl Predictor {
         if ultra {
             w1.push(vec![10000i32; 256 * nin]);
         }
+        if v1 {
+            w1.push(vec![10000i32; 256 * nin]);
+        }
         let mut p = Predictor {
             nbits,
             nctx,
+            nbase,
             nin,
             nsel,
             ultra,
+            v1,
+            avx2: detect_avx2(),
             t: vec![0u32; 1usize << nbits],
             stretch: build_stretch(),
             rt: build_rt(),
@@ -317,6 +397,7 @@ impl Predictor {
             pm: 2048,
             a1: Apm::new(256),
             a2: Apm::new(65536),
+            a3: Apm::new(65536),
             pr: 32768,
         };
         p.byte_update_contexts();
@@ -347,6 +428,10 @@ impl Predictor {
         self.ctxh[9] = hc(9, (c4 >> 8) & 0xFFFF);
         self.ctxh[10] = hc(10, c4 & 0x00FF_00FF);
         self.ctxh[11] = hc(11, c4 ^ c8.wrapping_mul(0x2545_F491));
+        if self.v1 {
+            self.ctxh[12] = hc(18, (c4 & 0xFF) | ((c4 >> 24) << 8));
+            self.ctxh[13] = hc(19, (c4 >> 8) & 0xFF | ((c8 & 0xFF) << 8));
+        }
     }
 
     /// Extra long / structured contexts of the ultra model (need the raw history).
@@ -362,12 +447,13 @@ impl Predictor {
         let at = |k: usize| -> u32 {
             if hist.len() >= k { hist[hist.len() - k] as u32 } else { 0 }
         };
-        self.ctxh[12] = hc(12, tail(hist, 10));
-        self.ctxh[13] = hc(13, tail(hist, 12));
-        self.ctxh[14] = hc(14, tail(hist, 16));
-        self.ctxh[15] = hc(15, tail(hist, 24));
-        self.ctxh[16] = hc(16, at(1) | (at(4) << 8) | (at(8) << 16));
-        self.ctxh[17] = hc(17, self.word ^ (self.c4 & 0xFFFF).wrapping_mul(0x9E37_79B1));
+        let o = self.nbase;
+        self.ctxh[o] = hc(12, tail(hist, 10));
+        self.ctxh[o + 1] = hc(13, tail(hist, 12));
+        self.ctxh[o + 2] = hc(14, tail(hist, 16));
+        self.ctxh[o + 3] = hc(15, tail(hist, 24));
+        self.ctxh[o + 4] = hc(16, at(1) | (at(4) << 8) | (at(8) << 16));
+        self.ctxh[o + 5] = hc(17, self.word ^ (self.c4 & 0xFFFF).wrapping_mul(0x9E37_79B1));
     }
 
     fn predict(&mut self) {
@@ -388,6 +474,7 @@ impl Predictor {
         } else {
             ((c0 & ((1 << (self.bitpos - 4)) - 1)) | (1 << (self.bitpos - 4))) as usize
         };
+        let mut hits = 0usize;
         for i in 0..self.nctx {
             let idx = self.base[i] + nib;
             let chk = self.chk[i];
@@ -398,6 +485,7 @@ impl Predictor {
             }
             self.idx[i] = idx;
             let n = ((s >> 18) & 63) as usize;
+            hits += (n != 0) as usize;
             let p12 = ((s & 0x3FFFF) >> 6) as i32;
             self.x[2 * i] = self.stretch[p12 as usize] as i32;
             self.x[2 * i + 1] = if n == 0 { 0 } else { ((p12 - 2048) * self.conf[n]) >> 8 };
@@ -420,15 +508,16 @@ impl Predictor {
             self.sel[3] = ((self.c4 >> 8) & 0xFF) as usize;
         }
         let nsel = self.nsel;
+        if self.v1 {
+            self.sel[nsel - 1] = hits * 8 + self.bitpos as usize;
+        }
 
         let mut dot2: i64 = 0;
         self.sel2 = c0 as usize;
         for k in 0..nsel {
-            let w = &self.w1[k][self.sel[k] * nin..self.sel[k] * nin + nin];
-            let mut dot: i64 = 0;
-            for i in 0..nin {
-                dot += w[i] as i64 * self.x[i] as i64;
-            }
+            let off = self.sel[k] * nin;
+            let w = &self.w1[k][off..off + nin];
+            let dot = dot(self.avx2, w, &self.x[..nin]);
             let st = ((dot >> 16) as i32).clamp(-2047, 2047);
             self.st1[k] = st;
             self.p1[k] = squash(st);
@@ -439,7 +528,13 @@ impl Predictor {
 
         let a1 = self.a1.pp(st2, c0 as usize);
         let a2 = self.a2.pp(st2, (c0 | ((self.c4 & 0xFF) << 8)) as usize);
-        let p = ((self.pm as u32) * 16 + a1 + 2 * a2) >> 2;
+        let p = if self.v1 {
+            let h = (self.c4 & 0xFFFF).wrapping_mul(0x9E37_79B1) >> 16;
+            let a3 = self.a3.pp(st2, ((h ^ c0.wrapping_mul(0x2F0B)) & 0xFFFF) as usize);
+            ((self.pm as u32) * 16 + a1 + 3 * a2 + 3 * a3) >> 3
+        } else {
+            ((self.pm as u32) * 16 + a1 + 2 * a2) >> 2
+        };
         self.pr = p.clamp(1, 65535);
     }
 
@@ -461,13 +556,12 @@ impl Predictor {
         // mixers
         let ybit = (y << 12) as i32;
         let (nin, nsel) = (self.nin, self.nsel);
+        let lr1 = if self.v1 { 3 } else { LR1 };
         for k in 0..nsel {
-            let err = (ybit - self.p1[k]) * LR1;
+            let err = (ybit - self.p1[k]) * lr1;
             let off = self.sel[k] * nin;
             let w = &mut self.w1[k][off..off + nin];
-            for i in 0..nin {
-                w[i] += (self.x[i] * err + 0x2000) >> 14;
-            }
+            train(self.avx2, w, &self.x[..nin], err);
         }
         let err2 = (ybit - self.pm) * LR2;
         for k in 0..nsel {
@@ -476,6 +570,9 @@ impl Predictor {
         }
         self.a1.update(y);
         self.a2.update(y);
+        if self.v1 {
+            self.a3.update(y);
+        }
 
         self.c0 = (self.c0 << 1) | y;
         self.bitpos += 1;

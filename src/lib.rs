@@ -36,11 +36,11 @@ use std::time::Duration;
 pub const MAGIC_V1: &[u8; 4] = b"DLB1";
 pub const MAGIC: &[u8; 4] = b"DLB2";
 /// Release name (shown by `dlb -V` and in the app); the number is `CARGO_PKG_VERSION`.
-pub const CODENAME: &str = "Dial-up Dragon";
+pub const CODENAME: &str = "Floppy Phoenix";
 /// Context-mixing model used by this build, stored in byte 4 of a `DLB2` header. A future model
 /// gets the next number and old archives keep decoding with the old one; a reader that does not
 /// know the number refuses the archive instead of producing garbage.
-pub const MODEL_VERSION: u8 = 0;
+pub const MODEL_VERSION: u8 = 1;
 pub(crate) const ERR_NEWER: &str = "this archive was made by a newer DLB (unknown model): update the program";
 const V1_HEADER: usize = 18;
 const V2_HEADER: usize = 22;
@@ -288,7 +288,7 @@ pub fn compress_payload(
         let data = &payload[a..b];
         let nbits = level_to_nbits(level, data.len());
         let nb = (nbits | if level >= 10 { cm::ULTRA_FLAG } else { 0 }) as u8;
-        let body = cm::cm_compress(data, nb as u32, prog)?;
+        let body = cm::cm_compress(data, nb as u32 | cm::ver_bits(MODEL_VERSION), prog)?;
         Some(if body.len() >= data.len() {
             BlockOut { stored: true, nbits: nb, body: Vec::new() }
         } else {
@@ -390,7 +390,7 @@ fn parse_blocks(blob: &[u8]) -> Result<(usize, u32, Vec<BlockInfo<'_>>), String>
         let raw = u32::from_le_bytes(e[0..4].try_into().unwrap()) as usize;
         let comp = u32::from_le_bytes(e[4..8].try_into().unwrap()) as usize;
         let stored = e[8] & 1 != 0;
-        let nbits = e[9] as u32;
+        let nbits = e[9] as u32 | cm::ver_bits(blob[4]);
         if pos.checked_add(comp).map_or(true, |end| end > blob.len()) {
             return Err("truncated file".into());
         }
